@@ -70,8 +70,7 @@ async function install() {
   if (process.platform === 'win32') {
     execFileSync('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command',
-      'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force',
-      archivePath, tmp,
+      'Expand-Archive -LiteralPath ' + JSON.stringify(archivePath) + ' -DestinationPath ' + JSON.stringify(tmp) + ' -Force',
     ]);
   } else {
     execFileSync('tar', ['-xzf', archivePath, '-C', tmp]);
