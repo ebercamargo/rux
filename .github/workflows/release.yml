@@ -1,0 +1,47 @@
+name: Release binaries
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: rux-windows-x86_64.zip
+            binary: target/release/rux.exe
+          - os: ubuntu-latest
+            asset: rux-linux-x86_64.tar.gz
+            binary: target/release/rux
+          - os: macos-14
+            asset: rux-macos-aarch64.tar.gz
+            binary: target/release/rux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo build --release
+      - name: Package and checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp "${{ matrix.binary }}" rux
+          tar -czf "${{ matrix.asset }}" rux
+          sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+      - name: Package and checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "${{ matrix.binary }}" rux.exe
+          Compress-Archive rux.exe "${{ matrix.asset }}"
+          $hash = (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "${{ matrix.asset }}.sha256" -Value "$hash  ${{ matrix.asset }}" -NoNewline
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          prerelease: true
