@@ -1,0 +1,39 @@
+{
+  "name": "rux-lang",
+  "version": "0.1.0-alpha.1",
+  "description": "RUX programming language CLI installer",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/ebercamargo/rux",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ebercamargo/rux.git",
+    "directory": "npm/rux-lang"
+  },
+  "bin": {
+    "rux": "bin/rux.cjs"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.cjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

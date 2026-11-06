@@ -1,0 +1,23 @@
+name: npm package validation
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'npm/rux-lang/**'
+      - '.github/workflows/npm-package.yml'
+  pull_request:
+    paths:
+      - 'npm/rux-lang/**'
+      - '.github/workflows/npm-package.yml'
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm test
+        working-directory: npm/rux-lang
+      - run: npm pack --dry-run --ignore-scripts
+        working-directory: npm/rux-lang
