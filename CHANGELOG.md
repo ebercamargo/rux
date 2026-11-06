@@ -4,10 +4,17 @@ All notable changes to RUX will be documented here. This project follows Semanti
 
 ## [Unreleased]
 
+### Added
+- Initial Rust lexer and parser with syntax-check CLI
+- Experimental AST interpreter with `rux run` and built-in `print`
+- Runtime errors for undefined variables, duplicate declarations and unknown functions
+- Hello World example and automated tests
+
 ### Planned
-- Lexer, parser and initial syntax tests
-- Static typing and diagnostics
+- Static typing and diagnostics with source locations
+- `loop` and `when` syntax and execution
+- Native code generation and Visual Engine
 
 ## [0.1.0-alpha.1] - Not released
 
-Initial development milestone. This entry does not indicate a published compiler or executable.
+Initial development milestone. No compiler release or executable distribution has been published.
