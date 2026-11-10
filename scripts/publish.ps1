@@ -66,9 +66,20 @@ $head = (git rev-parse HEAD).Trim()
 $remoteTag = (& git ls-remote --tags origin "refs/tags/$tag" | Out-String).Trim()
 if ($remoteTag) {
     $remoteSha = ($remoteTag -split '\s+')[0]
-    $localTagSha = (& git rev-parse "$tag^{}" 2>$null | Out-String).Trim()
-    if (-not $localTagSha -or $localTagSha -ne $head) {
-        Fail "$tag already exists and does not point to current main HEAD. Never move or overwrite published tags."
+    $localTagSha = (git rev-parse "$tag^{}").Trim()
+    if ($LASTEXITCODE -ne 0) { Fail "Cannot resolve existing tag $tag." }
+    if ($localTagSha -ne $head) {
+        # A release tag may legitimately predate later documentation or automation commits.
+        # Verify that its exact package, compiler and version files match the current release.
+        foreach ($releaseFile in @('VERSION', 'Cargo.toml', 'npm/rux-lang/package.json', 'npm/rux-lang/scripts/install.cjs', 'npm/rux-lang/bin/rux.cjs')) {
+            $taggedContent = git show "${tag}:$releaseFile"
+            if ($LASTEXITCODE -ne 0) { Fail "Cannot read $releaseFile from existing tag $tag." }
+            $currentContent = Get-Content (Join-Path $root $releaseFile) -Raw
+            if (($taggedContent -join "`n").TrimEnd() -ne $currentContent.TrimEnd()) {
+                Fail "$tag already exists with different release file $releaseFile. Create a new version; never move the tag."
+            }
+        }
+        Write-Host "$tag predates current main, but release files match. Reusing immutable tag."
     }
     Write-Host "$tag already exists on origin."
 } else {
