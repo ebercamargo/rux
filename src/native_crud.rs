@@ -1,5 +1,5 @@
 use std::{net::SocketAddr, path::Path, sync::{Arc, Mutex}};
-use axum::{extract::{Path as RoutePath, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
+use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
 
@@ -44,20 +44,29 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "application/manifest+json")], (*state.manifest).clone())
 }
 
-async fn list(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+#[derive(serde::Deserialize)]
+struct Page {
+    limit: Option<u32>,
+    before: Option<i64>,
+}
+async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
+    let limit = page.limit.unwrap_or(50).clamp(1, 100);
+    let before = page.before.unwrap_or(i64::MAX);
     let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut stmt = db.prepare("SELECT id, payload FROM records ORDER BY rowid DESC")
+    let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map([], |row| {
-        let id: String = row.get(0)?;
-        let payload: String = row.get(1)?;
-        Ok((id, payload))
+    let rows = stmt.query_map(params![before, limit], |row| {
+        let cursor: i64 = row.get(0)?;
+        let id: String = row.get(1)?;
+        let payload: String = row.get(2)?;
+        Ok((cursor, id, payload))
     }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut items = Vec::new();
     for row in rows {
-        let (id, payload) = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let (cursor, id, payload) = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let mut value: Value = serde_json::from_str(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         value["id"] = json!(id);
+        value["_cursor"] = json!(cursor);
         items.push(value);
     }
     Ok(Json(json!(items)))
@@ -101,7 +110,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let db = Connection::open(directory.join("records.sqlite")).map_err(|e| e.to_string())?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
-    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest) };
+    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content) };
     let router = Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
