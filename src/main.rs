@@ -50,6 +50,12 @@ fn main() {
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rux {}", env!("CARGO_PKG_VERSION"));
         }
+        [_, command, name, fields @ ..] if command == "crud" => {
+            if let Err(error) = rux::crud::create(name, fields) {
+                eprintln!("RUX error: {error}");
+                process::exit(1);
+            }
+        }
         [_, command, name] if command == "new" => {
             if let Err(error) = create_project(name) {
                 eprintln!("RUX error: {error}");
@@ -63,7 +69,7 @@ fn main() {
             execute_file(command, path);
         }
         _ => {
-            eprintln!("Usage: rux --version | rux new <project> | rux check [file.rux] | rux run [file.rux]");
+            eprintln!("Usage: rux --version | rux new <project> | rux check [file.rux] | rux run [file.rux] | rux crud <name> <field> [field...]");
             process::exit(2);
         }
     }
