@@ -20,9 +20,15 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
     let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
     fs::create_dir(directory).map_err(|e| e.to_string())?;
     fs::write(directory.join("index.html"), html).map_err(|e| e.to_string())?;
+    let server = include_str!("crud_server.js").replace("__RUX_FIELDS__", &fields_js);
+    fs::write(directory.join("server.js"), server).map_err(|e| e.to_string())?;
+    let manifest = format!(r#"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"#);
+    fs::write(directory.join("manifest.webmanifest"), manifest).map_err(|e| e.to_string())?;
     println!("CRUD created: {name}/index.html");
-    println!("Open {name}/index.html in any modern desktop or mobile browser.");
-    println!("Data is stored locally in that browser; shared server storage and native apps are not implemented yet.");
+    println!("  cd {name}");
+    println!("  node server.js");
+    println!("Open http://localhost:3000 in your browser.");
+    println!("Server data is saved in records.json. Bind is localhost only; native apps and authentication are not implemented yet.");
     Ok(())
 }
 
@@ -31,7 +37,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RUX | __RUX_TITLE__</title>
+<title>RUX | __RUX_TITLE__</title><link rel="manifest" href="/manifest.webmanifest">
 <style>
 :root{font-family:system-ui,-apple-system,sans-serif;color-scheme:light;background:#f5f6fa;color:#202333}
 *{box-sizing:border-box}body{margin:0;padding:24px}main{max-width:1050px;margin:auto}
@@ -62,9 +68,17 @@ const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
 let records=[];
+const remote=location.protocol==="http:"||location.protocol==="https:";
 try{const stored=JSON.parse(localStorage.getItem(key)||"[]");if(Array.isArray(stored))records=stored;}
 catch(e){status.textContent="Não foi possível ler os dados locais.";}
 function persist(){try{localStorage.setItem(key,JSON.stringify(records));return true;}catch(e){status.textContent="Erro ao salvar no armazenamento local.";return false;}}
+async function request(method,url,payload){
+ const response=await fetch(url,{method,headers:{"Content-Type":"application/json"},body:payload===undefined?undefined:JSON.stringify(payload)});
+ if(!response.ok)throw Error("HTTP "+response.status);
+ return response.json();
+}
+async function load(){if(!remote)return;try{records=await request("GET","/api/records");render();}catch(e){status.textContent="Não foi possível acessar a API.";}}
+
 function element(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e;}
 for(const field of fields){
  const label=element("label",field);const input=document.createElement("input");
@@ -77,12 +91,13 @@ const cancel=element("button","Cancelar");cancel.type="button";cancel.className=
 controls.append(save,cancel);form.append(controls);
 function reset(){editing=null;form.reset();cancel.hidden=true;document.getElementById("form-title").textContent="Novo registro";}
 cancel.addEventListener("click",reset);
-form.addEventListener("submit",event=>{
+form.addEventListener("submit",async event=>{
  event.preventDefault();
  if(!form.reportValidity())return;
  const values=Object.fromEntries(fields.map(f=>[f,form.elements.namedItem(f).value.trim()]));
  if(fields.some(f=>!values[f])){status.textContent="Preencha todos os campos.";return;}
  const before=records.map(r=>({...r}));
+ if(remote){try{if(editing!==null){await request("PUT","/api/records/"+editing,values);}else{await request("POST","/api/records",values);}status.textContent=editing===null?"Registro criado.":"Registro atualizado.";reset();await load();}catch(e){status.textContent="Erro ao salvar no servidor: "+e.message;}return;}
  if(editing!==null){const item=records.find(r=>r.id===editing);if(!item)return;Object.assign(item,values);}
  else{records.push({id:crypto.randomUUID(),...values});}
  if(!persist()){records=before;return;}
@@ -101,12 +116,12 @@ function render(){
   const edit=element("button","Editar");edit.type="button";edit.className="secondary";
   edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
   const remove=element("button","Excluir");remove.type="button";remove.className="danger";
-  remove.addEventListener("click",()=>{if(!confirm("Excluir este registro?"))return;const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
+  remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";await load();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
   actions.append(edit,remove);cell.append(actions);row.append(cell);body.append(row);
  }
 }
 document.getElementById("search").addEventListener("input",render);
-render();
+render();load();
 </script></body></html>"##;
 
 #[cfg(test)]
