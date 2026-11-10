@@ -1,10 +1,40 @@
-# CRUD web responsivo (primeira etapa)
+# RUX CRUD — prototipo funcional web + API
 
-Sem gerar nova versao npm ou tag, compile o codigo atual do repositorio com `cargo build` e execute:
+Este recurso ainda nao esta publicado no npm e nao altera versao nem tags.
+
+## Teste local (codigo-fonte atualizado)
+
+Requer Rust/Cargo para compilar o projeto RUX e Node.js para executar o servidor gerado.
 
 ```powershell
+cargo test
 cargo run -- crud clientes nome email telefone
-start .\clientes\index.html
+cd clientes
+node server.js
 ```
 
-O gerador cria uma interface responsiva com criar, listar, pesquisar, editar e excluir registros, usando armazenamento local do navegador. O HTML abre em Windows, Linux, macOS e navegadores moveis modernos. **Os dados nao sao compartilhados entre dispositivos** e o HTML ainda nao e um aplicativo nativo. A geracao de API e banco de dados, sincronizacao, autenticacao, PWA instalavel e empacotamento desktop/mobile sao etapas posteriores. Esta implementacao nao altera VERSION, tags Git nem o pacote npm publicado.
+Abra http://localhost:3000 no navegador. O servidor fornece o HTML responsivo e a API REST. Os registros sao gravados em `clientes/records.json` e permanecem apos reiniciar o servidor. O CRUD suporta criar, listar, pesquisar, editar e excluir.
+
+### API
+
+- `GET /api/records`: lista todos
+- `POST /api/records`: cria (JSON com todos os campos)
+- `PUT /api/records/{uuid}`: altera
+- `DELETE /api/records/{uuid}`: exclui
+
+O HTML aberto diretamente como arquivo ainda usa `localStorage`, apenas como modo offline local; nesse modo os dados nao sao compartilhados.
+
+## Compatibilidade e limites
+
+A interface funciona em navegadores modernos de Windows, Linux, macOS, Android e iOS. Isso NAO equivale a aplicativos nativos: nao ha APK, IPA ou instalador desktop. O servidor escuta apenas em 127.0.0.1; dispositivos na rede nao podem acessa-lo sem configuracao adicional. Nao ha autenticacao, banco SQL, migracoes, sincronizacao entre instancias, controle de concorrencia ou deploy seguro. O arquivo JSON e adequado apenas para prototipo local, nao producao.
+
+## Proximas entregas necessarias antes de uma nova versao
+
+1. Definicao declarativa de entidades em `.rux`, validada pelo parser.
+2. Geracao de backend e frontend a partir dessa definicao.
+3. Persistencia SQL (SQLite/PostgreSQL), validacoes, autenticacao e controle de concorrencia.
+4. Testes de integracao em CI para CRUD e banco.
+5. Distribuicao simples pelo CLI e suporte de editor.
+6. Empacotamento desktop e mobile (ou PWA documentado como web), com testes em cada plataforma.
+
+**Nenhuma nova release deve ser publicada ate concluir e validar o CRUD multiplataforma definido como meta.**
