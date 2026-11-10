@@ -26,7 +26,7 @@ pub fn create_typed(name: &str, typed: &[(String, String)]) -> Result<(), String
     let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
     fs::create_dir(directory).map_err(|e| e.to_string())?;
     fs::write(directory.join("index.html"), html).map_err(|e| e.to_string())?;
-    let types_js = typed.iter().map(|(field, ty)| format!("\\\"{field}\\\":\\\"{ty}\\\"")).collect::<Vec<_>>().join(",");
+    let types_js = typed.iter().map(|(field, ty)| format!("\"{field}\":\"{ty}\"")).collect::<Vec<_>>().join(",");
     let server = include_str!("crud_server.js").replace("__RUX_FIELDS__", &fields_js).replace("__RUX_TYPES__", &types_js);
     fs::write(directory.join("server.js"), server).map_err(|e| e.to_string())?;
     let manifest = format!(r###"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"###);
