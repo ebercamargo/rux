@@ -27,6 +27,7 @@ pub enum Expr {
     Number(String),
     Variable(String),
     Bool(bool),
+    Binary { left: Box<Expr>, op: Token, right: Box<Expr> },
 }
 
 pub fn parse(tokens: &[Token]) -> Result<Program, String> {
@@ -179,17 +180,46 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self) -> Result<Expr, String> {
+        self.binary(0)
+    }
+
+    fn binary(&mut self, min_prec: u8) -> Result<Expr, String> {
+        let mut left = self.primary()?;
+        loop {
+            let prec = match self.current() {
+                Token::EqualEqual | Token::BangEqual | Token::Less | Token::Greater | Token::LessEqual | Token::GreaterEqual => 1,
+                Token::Plus | Token::Minus => 2,
+                Token::Star | Token::Slash => 3,
+                _ => break,
+            };
+            if prec < min_prec { break; }
+            let op = self.current().clone();
+            self.pos += 1;
+            let right = self.binary(prec + 1)?;
+            left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    fn primary(&mut self) -> Result<Expr, String> {
         let value = match self.current() {
             Token::String(text) => Expr::Text(text.clone()),
             Token::Number(number) => Expr::Number(number.clone()),
             Token::Ident(name) if name == "true" => Expr::Bool(true),
             Token::Ident(name) if name == "false" => Expr::Bool(false),
             Token::Ident(name) => Expr::Variable(name.clone()),
+            Token::LParen => {
+                self.pos += 1;
+                let expr = self.expression()?;
+                self.expect(&Token::RParen)?;
+                return Ok(expr);
+            }
             other => return Err(format!("expected expression, found {other:?}")),
         };
         self.pos += 1;
         Ok(value)
     }
+
 }
 
 #[cfg(test)]
