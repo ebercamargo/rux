@@ -60,7 +60,7 @@ async fn list(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> 
 
 async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
-    let id = next_id();
+    let id = uuid::Uuid::new_v4().to_string();
     let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)", params![id, payload.to_string()])
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -84,14 +84,6 @@ async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if count == 0 { return Err(StatusCode::NOT_FOUND); }
     Ok(Json(json!({"deleted": true})))
-}
-
-fn next_id() -> String {
-    // UUID v4 via SQLite's randomblob, without introducing a second RNG dependency.
-    let id: String = Connection::open_in_memory().and_then(|db| {
-        db.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
-    }).unwrap_or_default();
-    format!("{}-{}-4{}-a{}-{}", &id[0..8], &id[8..12], &id[13..16], &id[17..20], &id[20..32])
 }
 
 pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), String> {
