@@ -7,7 +7,7 @@ pub enum Token {
 }
 
 pub fn lex(source: &str) -> Result<Vec<Token>, String> {
-    let mut chars = source.chars().peekable();
+    let mut chars = source.trim_start_matches('\u{feff}').chars().peekable();
     let mut tokens = Vec::new();
     while let Some(ch) = chars.next() {
         match ch {
@@ -80,6 +80,11 @@ mod tests {
         let tokens = lex("app Hello { fn main() { print(\"Hi\") } }").unwrap();
         assert_eq!(tokens[0], Token::App);
         assert!(tokens.contains(&Token::String("Hi".into())));
+    }
+    #[test]
+    fn accepts_utf8_bom() {
+        let tokens = lex("\u{feff}app Hello { fn main() { print(\"Hi\") } }").unwrap();
+        assert_eq!(tokens[0], Token::App);
     }
     #[test]
     fn rejects_unclosed_string() {
