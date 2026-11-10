@@ -44,10 +44,12 @@ async fn health_live() -> impl IntoResponse {
 
 async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     if !state.accepting.load(Ordering::Acquire) { return Err(StatusCode::SERVICE_UNAVAILABLE); }
-    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(json!({"status": "UP"})))
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Ok(Json(json!({"status": "UP"})))
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 async fn index(State(state): State<AppState>) -> Html<String> {
@@ -63,55 +65,64 @@ struct Page {
     limit: Option<u32>,
     before: Option<i64>,
 }
+
 async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
-    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let rows = stmt.query_map(params![before, limit], |row| {
-        let cursor: i64 = row.get(0)?;
-        let id: String = row.get(1)?;
-        let payload: String = row.get(2)?;
-        Ok((cursor, id, payload))
-    }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut items = Vec::new();
-    for row in rows {
-        let (cursor, id, payload) = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut value: Value = serde_json::from_str(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        value["id"] = json!(id);
-        value["_cursor"] = json!(cursor);
-        items.push(value);
-    }
-    Ok(Json(json!(items)))
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let rows = stmt.query_map(params![before, limit], |row| {
+            let cursor: i64 = row.get(0)?;
+            let id: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            Ok((cursor, id, payload))
+        }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (cursor, id, payload) = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let mut value: Value = serde_json::from_str(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            value["id"] = json!(id);
+            value["_cursor"] = json!(cursor);
+            items.push(value);
+        }
+        Ok(Json(json!(items)))
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
-    let id = uuid::Uuid::new_v4().to_string();
-    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)", params![id, payload.to_string()])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    payload["id"] = json!(id);
-    Ok((StatusCode::CREATED, Json(payload)))
+    tokio::task::spawn_blocking(move || {
+        let id = uuid::Uuid::new_v4().to_string();
+        let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)", params![id, payload.to_string()])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        payload["id"] = json!(id);
+        Ok((StatusCode::CREATED, Json(payload)))
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>, Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
-    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if count == 0 { return Err(StatusCode::NOT_FOUND); }
-    payload["id"] = json!(id);
-    Ok(Json(payload))
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if count == 0 { return Err(StatusCode::NOT_FOUND); }
+        payload["id"] = json!(id);
+        Ok(Json(payload))
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if count == 0 { return Err(StatusCode::NOT_FOUND); }
-    Ok(Json(json!({"deleted": true})))
+    tokio::task::spawn_blocking(move || {
+        let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if count == 0 { return Err(StatusCode::NOT_FOUND); }
+        Ok(Json(json!({"deleted": true})))
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), String> {
