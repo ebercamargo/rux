@@ -1,11 +1,12 @@
-use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
+use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
-use rusqlite::{params, Connection};
+use rusqlite::params;
+use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Connection>>,
+    db: r2d2::Pool<SqliteConnectionManager>,
     fields: Arc<Vec<(String, String)>>,
     html: Arc<String>,
     manifest: Arc<String>,
@@ -43,7 +44,7 @@ async fn health_live() -> impl IntoResponse {
 
 async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     if !state.accepting.load(Ordering::Acquire) { return Err(StatusCode::SERVICE_UNAVAILABLE); }
-    let db = state.db.lock().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     Ok(Json(json!({"status": "UP"})))
@@ -65,7 +66,7 @@ struct Page {
 async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
-    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let rows = stmt.query_map(params![before, limit], |row| {
@@ -88,7 +89,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
 async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
     let id = uuid::Uuid::new_v4().to_string();
-    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)", params![id, payload.to_string()])
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     payload["id"] = json!(id);
@@ -97,7 +98,7 @@ async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Resu
 
 async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>, Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
-    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if count == 0 { return Err(StatusCode::NOT_FOUND); }
@@ -106,7 +107,7 @@ async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
 }
 
 async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.db.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if count == 0 { return Err(StatusCode::NOT_FOUND); }
@@ -120,11 +121,14 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .map_err(|e| format!("cannot read generated UI: {e}"))?;
     let manifest_content = std::fs::read_to_string(directory.join("manifest.webmanifest"))
         .map_err(|e| format!("cannot read manifest: {e}"))?;
-    let db = Connection::open(directory.join("records.sqlite")).map_err(|e| e.to_string())?;
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
+    let manager = SqliteConnectionManager::file(directory.join("records.sqlite"))
+        .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout=5000;"));
+    let db = r2d2::Pool::builder().max_size(8).build(manager).map_err(|e| e.to_string())?;
+    db.get().map_err(|e| e.to_string())?
+        .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
