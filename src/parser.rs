@@ -19,6 +19,7 @@ pub enum Statement {
     Assign { name: String, value: Expr },
     When { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> },
     Loop { count: Expr, body: Vec<Statement> },
+    LoopWhile { condition: Expr, body: Vec<Statement> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,12 @@ impl Parser<'_> {
             }
             Token::Loop => {
                 self.pos += 1;
+                if self.at(&Token::While) {
+                    self.pos += 1;
+                    let condition = self.expression()?;
+                    let body = self.block()?;
+                    return Ok(Statement::LoopWhile { condition, body });
+                }
                 let count = self.expression()?;
                 let body = self.block()?;
                 return Ok(Statement::Loop { count, body });
