@@ -22,7 +22,7 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
     fs::write(directory.join("index.html"), html).map_err(|e| e.to_string())?;
     let server = include_str!("crud_server.js").replace("__RUX_FIELDS__", &fields_js);
     fs::write(directory.join("server.js"), server).map_err(|e| e.to_string())?;
-    let manifest = format!(r#"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"#);
+    let manifest = format!(r###"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"###);
     fs::write(directory.join("manifest.webmanifest"), manifest).map_err(|e| e.to_string())?;
     println!("CRUD created: {name}/index.html");
     println!("  cd {name}");
