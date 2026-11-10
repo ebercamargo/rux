@@ -1,0 +1,22 @@
+{
+  "RUX app": {
+    "prefix": "app",
+    "body": [
+      "app ${1:HelloWorld} {",
+      "    fn main() {",
+      "        print(\"${2:Hello, World!}\")",
+      "    }",
+      "}"
+    ],
+    "description": "Create a RUX app with main"
+  },
+  "RUX function": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}() {",
+      "    $0",
+      "}"
+    ],
+    "description": "Create a RUX function"
+  }
+}
