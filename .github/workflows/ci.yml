@@ -39,3 +39,9 @@ jobs:
           curl -fsS -X DELETE "http://localhost:3000/api/records/$id" > deleted.json
           curl -fsS http://localhost:3000/api/records > empty.json
           node -e 'if(require("./empty.json").length!==0)process.exit(1)'
+      - name: Generate CRUD from RUX source
+        run: |
+          cargo run --quiet -- crud-from examples/clientes_crud.rux
+          test -f Clientes/index.html
+          test -f Clientes/server.js
+          grep -q 'nome' Clientes/server.js
