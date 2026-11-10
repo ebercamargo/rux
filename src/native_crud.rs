@@ -96,7 +96,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if !directory.exists() { super::crud::create_typed(name, &fields)?; }
     let html = std::fs::read_to_string(directory.join("index.html"))
         .map_err(|e| format!("cannot read generated UI: {e}"))?;
-    let manifest = std::fs::read_to_string(directory.join("manifest.webmanifest"))
+    let manifest_content = std::fs::read_to_string(directory.join("manifest.webmanifest"))
         .map_err(|e| format!("cannot read manifest: {e}"))?;
     let db = Connection::open(directory.join("records.sqlite")).map_err(|e| e.to_string())?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
