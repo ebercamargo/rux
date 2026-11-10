@@ -45,3 +45,17 @@ jobs:
           test -f Clientes/index.html
           test -f Clientes/server.js
           grep -q 'nome' Clientes/server.js
+      - name: Validate typed CRUD REST payloads
+        run: |
+          cd Clientes
+          PORT=3100 node server.js > typed.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3100/api/records >/dev/null; then break; fi
+            sleep 1
+          done
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"not-an-email","telefone":"123"}' http://localhost:3100/api/records)
+          test "$status" = "400"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"ana@example.com","telefone":"123"}' http://localhost:3100/api/records)
+          test "$status" = "201"

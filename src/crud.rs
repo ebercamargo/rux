@@ -7,6 +7,12 @@ fn valid_name(value: &str) -> bool {
 }
 
 pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
+    let typed = fields.iter().map(|f| (f.clone(), "Text".to_string())).collect::<Vec<_>>();
+    create_typed(name, &typed)
+}
+
+pub fn create_typed(name: &str, typed: &[(String, String)]) -> Result<(), String> {
+    let fields = typed.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     if !valid_name(name) { return Err("CRUD name must contain letters, digits or underscore and start with a letter".into()); }
     if fields.is_empty() { return Err("Provide at least one field, e.g. rux crud clientes nome email telefone".into()); }
     if fields.len() > 20 || fields.iter().any(|f| !valid_name(f) || f == "id") {
@@ -20,7 +26,8 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
     let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
     fs::create_dir(directory).map_err(|e| e.to_string())?;
     fs::write(directory.join("index.html"), html).map_err(|e| e.to_string())?;
-    let server = include_str!("crud_server.js").replace("__RUX_FIELDS__", &fields_js);
+    let types_js = typed.iter().map(|(field, ty)| format!("\"{field}\":\"{ty}\"")).collect::<Vec<_>>().join(",");
+    let server = include_str!("crud_server.js").replace("__RUX_FIELDS__", &fields_js).replace("__RUX_TYPES__", &types_js);
     fs::write(directory.join("server.js"), server).map_err(|e| e.to_string())?;
     let manifest = format!(r###"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"###);
     fs::write(directory.join("manifest.webmanifest"), manifest).map_err(|e| e.to_string())?;

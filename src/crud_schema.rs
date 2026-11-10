@@ -5,11 +5,16 @@ use std::fs;
 pub fn generate(path: &str) -> Result<(), String> {
     if !path.ends_with(".rux") { return Err("expected a .rux file".into()); }
     let source = fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let (name, fields) = parse_schema(&source)?;
-    super::crud::create(&name, &fields)
+    let (name, fields) = parse_typed_schema(&source)?;
+    super::crud::create_typed(&name, &fields)
 }
 
 pub fn parse_schema(source: &str) -> Result<(String, Vec<String>), String> {
+    let (name, fields) = parse_typed_schema(source)?;
+    Ok((name, fields.into_iter().map(|(name, _)| name).collect()))
+}
+
+pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>), String> {
     let mut app = None;
     let mut entity = None;
     let mut fields = Vec::new();
@@ -61,7 +66,7 @@ pub fn parse_schema(source: &str) -> Result<(String, Vec<String>), String> {
             if !matches!(ty, "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") {
                 return Err(format!("line {}: unsupported field type: {ty}", index + 1));
             }
-            fields.push(field.to_string());
+            fields.push((field.to_string(), ty.to_string()));
             continue;
         }
         return Err(format!("line {}: unsupported declaration", index + 1));
@@ -75,7 +80,7 @@ pub fn parse_schema(source: &str) -> Result<(String, Vec<String>), String> {
         return Err("invalid app name".into());
     }
     let mut unique = std::collections::HashSet::new();
-    if fields.len() > 20 || fields.iter().any(|f| f == "id" || !f.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) || !f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !unique.insert(f.clone())) {
+    if fields.len() > 20 || fields.iter().any(|(f, _)| f == "id" || !f.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) || !f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !unique.insert(f.clone())) {
         return Err("invalid, duplicate or reserved field (maximum 20)".into());
     }
     Ok((name, fields))
