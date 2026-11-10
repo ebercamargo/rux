@@ -36,6 +36,17 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
     Ok(result)
 }
 
+async fn health_live() -> impl IntoResponse {
+    Json(json!({"status": "UP"}))
+}
+
+async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let db = state.db.lock().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    Ok(Json(json!({"status": "UP"})))
+}
+
 async fn index(State(state): State<AppState>) -> Html<String> {
     Html((*state.html).clone())
 }
@@ -112,6 +123,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .map_err(|e| e.to_string())?;
     let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content) };
     let router = Router::new()
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/manifest.webmanifest", get(manifest))
