@@ -1,6 +1,6 @@
 {
   "name": "rux-lang",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "RUX programming language CLI installer",
   "license": "Apache-2.0",
   "homepage": "https://github.com/ebercamargo/rux",
