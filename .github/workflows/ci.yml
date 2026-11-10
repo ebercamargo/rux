@@ -18,3 +18,24 @@ jobs:
       - run: |
           output="$(cargo run --quiet -- run examples/hello.rux)"
           test "$output" = "Hello, World!"
+      - name: CRUD REST integration smoke test
+        run: |
+          cargo run --quiet -- crud ci_customers name email
+          cd ci_customers
+          node server.js > server.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/records >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"name":"Ana","email":"ana@example.com"}' http://localhost:3000/api/records > created.json
+          node -e 'const r=require("./created.json");if(r.name!=="Ana"||!r.id)process.exit(1)'
+          curl -fsS http://localhost:3000/api/records > listed.json
+          node -e 'const r=require("./listed.json");if(r.length!==1||r[0].name!=="Ana")process.exit(1)'
+          id=$(node -p 'require("./created.json").id')
+          curl -fsS -X PUT -H 'Content-Type: application/json' -d '{"name":"Bia","email":"bia@example.com"}' "http://localhost:3000/api/records/$id" > updated.json
+          node -e 'if(require("./updated.json").name!=="Bia")process.exit(1)'
+          curl -fsS -X DELETE "http://localhost:3000/api/records/$id" > deleted.json
+          curl -fsS http://localhost:3000/api/records > empty.json
+          node -e 'if(require("./empty.json").length!==0)process.exit(1)'
