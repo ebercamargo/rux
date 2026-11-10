@@ -85,5 +85,7 @@ jobs:
           curl -fsS -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"ana@example.com","telefone":"123"}' http://localhost:3000/api/records > native-created.json
           node -e 'if(!require("./native-created.json").id)process.exit(1)'
           test -f Clientes/records.sqlite
+          curl -fsS http://localhost:3000/health/live | grep -q UP
+          curl -fsS http://localhost:3000/health/ready | grep -q UP
           curl -fsS http://localhost:3000/api/records > native-listed.json
           node -e 'if(require("./native-listed.json").length!==1)process.exit(1)'
