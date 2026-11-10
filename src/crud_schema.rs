@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::fs;
 
 /// Minimal declarative CRUD schema reader. This is intentionally independent
 /// from the executable RUX parser until data declarations become first-class AST nodes.
