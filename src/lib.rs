@@ -1,4 +1,5 @@
 pub mod crud;
+pub mod crud_schema;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;

@@ -1,0 +1,7 @@
+app Clientes {
+    data Cliente {
+        nome: Text
+        email: Email
+        telefone: Text
+    }
+}
