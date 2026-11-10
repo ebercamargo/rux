@@ -3,6 +3,7 @@ pub enum Token {
     App, Fn, Let, Var, Loop, When, Else, While, Until,
     Ident(String), Number(String), String(String),
     LBrace, RBrace, LParen, RParen, Comma, Equal, Semicolon,
+    Plus, Minus, Star, Slash, Less, Greater, EqualEqual, BangEqual, LessEqual, GreaterEqual,
     Newline, Eof,
 }
 
@@ -18,13 +19,20 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             '(' => tokens.push(Token::LParen),
             ')' => tokens.push(Token::RParen),
             ',' => tokens.push(Token::Comma),
-            '=' => tokens.push(Token::Equal),
+            '=' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::EqualEqual } else { Token::Equal }),
+            '!' if chars.peek() == Some(&'=') => { chars.next(); tokens.push(Token::BangEqual); }
+            '<' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::LessEqual } else { Token::Less }),
+            '>' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::GreaterEqual } else { Token::Greater }),
+            '+' => tokens.push(Token::Plus),
+            '-' => tokens.push(Token::Minus),
+            '*' => tokens.push(Token::Star),
             ';' => tokens.push(Token::Semicolon),
             '/' if chars.peek() == Some(&'/') => {
                 for c in chars.by_ref() {
                     if c == '\n' { tokens.push(Token::Newline); break; }
                 }
             }
+            '/' => tokens.push(Token::Slash),
             '"' => {
                 let mut value = String::new();
                 let mut closed = false;
