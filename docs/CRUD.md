@@ -56,3 +56,12 @@ A interface funciona em navegadores modernos de Windows, Linux, macOS, Android e
 6. Empacotamento desktop e mobile (ou PWA documentado como web), com testes em cada plataforma.
 
 **Nenhuma nova release deve ser publicada ate concluir e validar o CRUD multiplataforma definido como meta.**
+
+## Executar diretamente um CRUD declarativo
+
+```sh
+cargo run -- check examples/clientes_crud.rux
+cargo run -- run examples/clientes_crud.rux
+```
+
+O comando `run` gera a pasta `Clientes` caso ainda nao exista e inicia o servidor Node.js local em http://localhost:3000. Node.js deve estar instalado. Se a pasta ja existir, o servidor existente e reutilizado: alteracoes no schema nao regeneram automaticamente os arquivos. O armazenamento continua em JSON; SQLite, PostgreSQL, autenticacao e empacotamento nativo ainda nao foram implementados.

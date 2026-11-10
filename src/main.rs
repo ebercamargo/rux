@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, process};
+use std::{env, fs, path::Path, process::{self, Command}};
 
 fn create_project(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().next().unwrap().is_ascii_alphabetic()
@@ -25,6 +25,32 @@ fn execute_file(command: &str, path: &str) {
         eprintln!("cannot read {path}: {error}");
         process::exit(1);
     });
+    if source.lines().any(|line| line.trim_start().starts_with("data ")) {
+        let (name, _) = rux::crud_schema::parse_typed_schema(&source).unwrap_or_else(|error| {
+            eprintln!("RUX schema error: {error}");
+            process::exit(1);
+        });
+        if command == "check" {
+            println!("Schema OK: {path}");
+            return;
+        }
+        let output = Path::new(&name);
+        if !output.exists() {
+            if let Err(error) = rux::crud_schema::generate(path) {
+                eprintln!("RUX error: {error}");
+                process::exit(1);
+            }
+        } else if !output.join("server.js").is_file() {
+            eprintln!("RUX error: directory {name} already exists without a generated server; refusing to overwrite");
+            process::exit(1);
+        }
+        println!("Starting RUX CRUD: http://localhost:3000");
+        let status = Command::new("node").arg("server.js").current_dir(output).status().unwrap_or_else(|error| {
+            eprintln!("cannot start Node.js: {error}");
+            process::exit(1);
+        });
+        process::exit(status.code().unwrap_or(1));
+    }
     if command == "check" {
         match rux::check(&source) {
             Ok(()) => println!("Syntax OK: {path}"),
