@@ -21,6 +21,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all-targets
       - run: cargo build --release
+      - name: Verify compiled binary version
+        shell: bash
+        run: |
+          expected="rux ${GITHUB_REF_NAME#v}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            actual="$(target/release/rux.exe --version | tr -d '\r')"
+          else
+            actual="$(target/release/rux --version | tr -d '\r')"
+          fi
+          echo "Expected: $expected"
+          echo "Actual: $actual"
+          test "$actual" = "$expected"
       - name: Package and checksum (Unix)
         if: runner.os != 'Windows'
         shell: bash
