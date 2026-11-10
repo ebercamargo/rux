@@ -1,6 +1,6 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
-    App, Fn, Let, Var, Loop, When, Else, While, Until,
+    App, Fn, Let, Var, Loop, When, Else, While, Until, Return,
     Ident(String), Number(String), String(String),
     LBrace, RBrace, LParen, RParen, Comma, Equal, Semicolon,
     Plus, Minus, Star, Slash, Less, Greater, EqualEqual, BangEqual, LessEqual, GreaterEqual,
@@ -69,7 +69,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
                     "let" => Token::Let, "var" => Token::Var,
                     "loop" => Token::Loop, "when" => Token::When,
                     "else" => Token::Else, "while" => Token::While,
-                    "until" => Token::Until,
+                    "until" => Token::Until, "return" => Token::Return,
                     _ => Token::Ident(s),
                 });
             }
