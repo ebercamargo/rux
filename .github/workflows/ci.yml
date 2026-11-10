@@ -59,3 +59,16 @@ jobs:
           test "$status" = "400"
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"ana@example.com","telefone":"123"}' http://localhost:3100/api/records)
           test "$status" = "201"
+      - name: Run declarative RUX CRUD directly
+        run: |
+          cargo run --quiet -- check examples/clientes_crud.rux
+          rm -rf Clientes
+          cargo run --quiet -- run examples/clientes_crud.rux > rux-crud.log 2>&1 &
+          rux_pid=$!
+          trap 'kill $rux_pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3000/api/records > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://localhost:3000/api/records > /dev/null
+          test -f Clientes/server.js
