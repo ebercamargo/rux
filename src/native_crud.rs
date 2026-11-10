@@ -8,6 +8,7 @@ struct AppState {
     db: Arc<Mutex<Connection>>,
     fields: Arc<Vec<(String, String)>>,
     html: Arc<String>,
+    manifest: Arc<String>,
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -37,6 +38,10 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
 
 async fn index(State(state): State<AppState>) -> Html<String> {
     Html((*state.html).clone())
+}
+
+async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, "application/manifest+json")], (*state.manifest).clone())
 }
 
 async fn list(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
@@ -91,13 +96,16 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if !directory.exists() { super::crud::create_typed(name, &fields)?; }
     let html = std::fs::read_to_string(directory.join("index.html"))
         .map_err(|e| format!("cannot read generated UI: {e}"))?;
+    let manifest = std::fs::read_to_string(directory.join("manifest.webmanifest"))
+        .map_err(|e| format!("cannot read manifest: {e}"))?;
     let db = Connection::open(directory.join("records.sqlite")).map_err(|e| e.to_string())?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
-    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html) };
+    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest) };
     let router = Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
+        .route("/manifest.webmanifest", get(manifest))
         .route("/api/records", get(list).post(create))
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
         .with_state(state);
