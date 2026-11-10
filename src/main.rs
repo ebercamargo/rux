@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, process::{self, Command}};
+use std::{env, fs, path::Path, process};
 
 fn create_project(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().next().unwrap().is_ascii_alphabetic()
@@ -34,22 +34,19 @@ fn execute_file(command: &str, path: &str) {
             println!("Schema OK: {path}");
             return;
         }
-        let output = Path::new(&name);
-        if !output.exists() {
-            if let Err(error) = rux::crud_schema::generate(path) {
-                eprintln!("RUX error: {error}");
-                process::exit(1);
-            }
-        } else if !output.join("server.js").is_file() {
-            eprintln!("RUX error: directory {name} already exists without a generated server; refusing to overwrite");
-            process::exit(1);
-        }
-        println!("Starting RUX CRUD: http://localhost:3000");
-        let status = Command::new("node").arg("server.js").current_dir(output).status().unwrap_or_else(|error| {
-            eprintln!("cannot start Node.js: {error}");
+        let (_, fields) = rux::crud_schema::parse_typed_schema(&source).unwrap_or_else(|error| {
+            eprintln!("RUX schema error: {error}");
             process::exit(1);
         });
-        process::exit(status.code().unwrap_or(1));
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap_or_else(|error| {
+            eprintln!("cannot initialize runtime: {error}");
+            process::exit(1);
+        });
+        if let Err(error) = runtime.block_on(rux::native_crud::serve(&name, fields)) {
+            eprintln!("RUX native CRUD error: {error}");
+            process::exit(1);
+        }
+        return;
     }
     if command == "check" {
         match rux::check(&source) {

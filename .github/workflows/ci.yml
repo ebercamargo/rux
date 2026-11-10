@@ -72,3 +72,21 @@ jobs:
           done
           curl -fsS http://localhost:3000/api/records > /dev/null
           test -f Clientes/server.js
+      - name: Native SQLite CRUD API smoke test
+        run: |
+          cargo run --quiet -- run examples/clientes_crud.rux > native.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://localhost:3000/api/records >/dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"invalid","telefone":"123"}' http://localhost:3000/api/records)" = "400"
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"nome":"Ana","email":"ana@example.com","telefone":"123"}' http://localhost:3000/api/records > native-created.json
+          node -e 'if(!require("./native-created.json").id)process.exit(1)'
+          test -f Clientes/records.sqlite
+          curl -fsS http://localhost:3000/health/live | grep -q UP
+          curl -fsS http://localhost:3000/health/ready | grep -q UP
+          seq 1 50 | xargs -P 10 -I {} curl -fsS http://localhost:3000/health/ready > /dev/null
+          curl -fsS http://localhost:3000/api/records > native-listed.json
+          node -e 'if(require("./native-listed.json").length!==1)process.exit(1)'
