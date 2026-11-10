@@ -22,9 +22,9 @@ Expected output from `run`:
 Hello, World!
 ```
 
-The interpreter supports a deliberately small subset: `app`, zero-argument `fn main()`, `let`/`var` declarations, text and integer literals, variable references, and built-in `print`. It rejects undefined variables, duplicate bindings and unknown calls. `check` validates **syntax only**, not runtime semantics.
+The interpreter supports a deliberately small subset: `app`, zero-argument `fn main()`, `let`/`var` declarations, mutable reassignment, text/integer/boolean literals, variable references, built-in `print`, `when`/`else` with boolean conditions, `loop <integer> { ... }` counted loops, `loop while` conditional loops, integer arithmetic/comparisons, and user-defined functions with positional parameters and `return`. It rejects undefined variables, duplicate bindings and unknown calls. `check` validates **syntax only**, not runtime semantics.
 
-It does **not** compile native code, provide a type checker, support reassignment, execute other user-defined functions, or generate websites. `loop` and `when` are reserved for future implementation.
+It does **not** compile native code, provide a type checker, support a static type checker, named arguments, modules, collections, or implement the full `loop`/`when` language design. Counted loops have a 100000 iteration limit, and execution has a 100000 statement budget.
 
 ## Project docs
 

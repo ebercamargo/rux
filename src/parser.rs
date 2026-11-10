@@ -9,6 +9,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub name: String,
+    pub params: Vec<String>,
     pub body: Vec<Statement>,
 }
 
@@ -16,6 +17,11 @@ pub struct Function {
 pub enum Statement {
     Bind { name: String, mutable: bool, value: Expr },
     Call { name: String, args: Vec<Expr> },
+    Assign { name: String, value: Expr },
+    When { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> },
+    Loop { count: Expr, body: Vec<Statement> },
+    LoopWhile { condition: Expr, body: Vec<Statement> },
+    Return(Expr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +29,9 @@ pub enum Expr {
     Text(String),
     Number(String),
     Variable(String),
+    Bool(bool),
+    Binary { left: Box<Expr>, op: Token, right: Box<Expr> },
+    Call { name: String, args: Vec<Expr> },
 }
 
 pub fn parse(tokens: &[Token]) -> Result<Program, String> {
@@ -40,6 +49,11 @@ pub fn parse(tokens: &[Token]) -> Result<Program, String> {
         parser.expect(&Token::Fn)?;
         let function_name = parser.ident()?;
         parser.expect(&Token::LParen)?;
+        let mut params = Vec::new();
+        if !parser.at(&Token::RParen) {
+            params.push(parser.ident()?);
+            while parser.at(&Token::Comma) { parser.pos += 1; params.push(parser.ident()?); }
+        }
         parser.expect(&Token::RParen)?;
         parser.expect(&Token::LBrace)?;
         parser.skip_separators();
@@ -52,7 +66,7 @@ pub fn parse(tokens: &[Token]) -> Result<Program, String> {
             parser.skip_separators();
         }
         parser.expect(&Token::RBrace)?;
-        functions.push(Function { name: function_name, body });
+        functions.push(Function { name: function_name, params, body });
         parser.skip_separators();
     }
     parser.expect(&Token::RBrace)?;
@@ -101,6 +115,19 @@ impl Parser<'_> {
         }
     }
 
+    fn block(&mut self) -> Result<Vec<Statement>, String> {
+        self.expect(&Token::LBrace)?;
+        self.skip_separators();
+        let mut body = Vec::new();
+        while !self.at(&Token::RBrace) {
+            if self.at(&Token::Eof) { return Err("unexpected end of file in block".into()); }
+            body.push(self.statement()?);
+            self.skip_separators();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(body)
+    }
+
     fn statement(&mut self) -> Result<Statement, String> {
         let statement = match self.current() {
             Token::Let | Token::Var => {
@@ -111,8 +138,40 @@ impl Parser<'_> {
                 let value = self.expression()?;
                 Statement::Bind { name, mutable, value }
             }
+            Token::Return => {
+                self.pos += 1;
+                Statement::Return(self.expression()?)
+            }
+            Token::When => {
+                self.pos += 1;
+                let condition = self.expression()?;
+                let then_body = self.block()?;
+                self.skip_separators();
+                let else_body = if self.at(&Token::Else) {
+                    self.pos += 1;
+                    self.block()?
+                } else { Vec::new() };
+                return Ok(Statement::When { condition, then_body, else_body });
+            }
+            Token::Loop => {
+                self.pos += 1;
+                if self.at(&Token::While) {
+                    self.pos += 1;
+                    let condition = self.expression()?;
+                    let body = self.block()?;
+                    return Ok(Statement::LoopWhile { condition, body });
+                }
+                let count = self.expression()?;
+                let body = self.block()?;
+                return Ok(Statement::Loop { count, body });
+            }
             Token::Ident(_) => {
                 let name = self.ident()?;
+                if self.at(&Token::Equal) {
+                    self.pos += 1;
+                    let value = self.expression()?;
+                    return Ok(Statement::Assign { name, value });
+                }
                 self.expect(&Token::LParen)?;
                 let mut args = Vec::new();
                 if !self.at(&Token::RParen) {
@@ -140,15 +199,60 @@ impl Parser<'_> {
     }
 
     fn expression(&mut self) -> Result<Expr, String> {
+        self.binary(0)
+    }
+
+    fn binary(&mut self, min_prec: u8) -> Result<Expr, String> {
+        let mut left = self.primary()?;
+        loop {
+            let prec = match self.current() {
+                Token::EqualEqual | Token::BangEqual | Token::Less | Token::Greater | Token::LessEqual | Token::GreaterEqual => 1,
+                Token::Plus | Token::Minus => 2,
+                Token::Star | Token::Slash => 3,
+                _ => break,
+            };
+            if prec < min_prec { break; }
+            let op = self.current().clone();
+            self.pos += 1;
+            let right = self.binary(prec + 1)?;
+            left = Expr::Binary { left: Box::new(left), op, right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    fn primary(&mut self) -> Result<Expr, String> {
         let value = match self.current() {
             Token::String(text) => Expr::Text(text.clone()),
             Token::Number(number) => Expr::Number(number.clone()),
-            Token::Ident(name) => Expr::Variable(name.clone()),
+            Token::Ident(name) if name == "true" => Expr::Bool(true),
+            Token::Ident(name) if name == "false" => Expr::Bool(false),
+            Token::Ident(name) => {
+                let name = name.clone();
+                self.pos += 1;
+                if self.at(&Token::LParen) {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    if !self.at(&Token::RParen) {
+                        args.push(self.expression()?);
+                        while self.at(&Token::Comma) { self.pos += 1; args.push(self.expression()?); }
+                    }
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::Call { name, args });
+                }
+                return Ok(Expr::Variable(name));
+            },
+            Token::LParen => {
+                self.pos += 1;
+                let expr = self.expression()?;
+                self.expect(&Token::RParen)?;
+                return Ok(expr);
+            }
             other => return Err(format!("expected expression, found {other:?}")),
         };
         self.pos += 1;
         Ok(value)
     }
+
 }
 
 #[cfg(test)]
@@ -170,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_nested_call() {
-        assert!(parse(&lex("app A { fn main() { print(other()) } }").unwrap()).is_err());
+    fn parses_nested_call() {
+        assert!(parse(&lex("app A { fn main() { print(other()) } }").unwrap()).is_ok());
     }
 }
