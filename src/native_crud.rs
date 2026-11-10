@@ -134,7 +134,11 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .route("/api/records", get(list).post(create))
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
         .with_state(state);
-    let address = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
+        .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
+    let address: SocketAddr = format!("{host}:{port}").parse()
+        .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite, no Node.js)");
     axum::serve(listener, router)
