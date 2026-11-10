@@ -16,6 +16,9 @@ pub struct Function {
 pub enum Statement {
     Bind { name: String, mutable: bool, value: Expr },
     Call { name: String, args: Vec<Expr> },
+    Assign { name: String, value: Expr },
+    When { condition: Expr, then_body: Vec<Statement>, else_body: Vec<Statement> },
+    Loop { count: Expr, body: Vec<Statement> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +26,7 @@ pub enum Expr {
     Text(String),
     Number(String),
     Variable(String),
+    Bool(bool),
 }
 
 pub fn parse(tokens: &[Token]) -> Result<Program, String> {
@@ -101,6 +105,19 @@ impl Parser<'_> {
         }
     }
 
+    fn block(&mut self) -> Result<Vec<Statement>, String> {
+        self.expect(&Token::LBrace)?;
+        self.skip_separators();
+        let mut body = Vec::new();
+        while !self.at(&Token::RBrace) {
+            if self.at(&Token::Eof) { return Err("unexpected end of file in block".into()); }
+            body.push(self.statement()?);
+            self.skip_separators();
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(body)
+    }
+
     fn statement(&mut self) -> Result<Statement, String> {
         let statement = match self.current() {
             Token::Let | Token::Var => {
@@ -111,8 +128,30 @@ impl Parser<'_> {
                 let value = self.expression()?;
                 Statement::Bind { name, mutable, value }
             }
+            Token::When => {
+                self.pos += 1;
+                let condition = self.expression()?;
+                let then_body = self.block()?;
+                self.skip_separators();
+                let else_body = if self.at(&Token::Else) {
+                    self.pos += 1;
+                    self.block()?
+                } else { Vec::new() };
+                return Ok(Statement::When { condition, then_body, else_body });
+            }
+            Token::Loop => {
+                self.pos += 1;
+                let count = self.expression()?;
+                let body = self.block()?;
+                return Ok(Statement::Loop { count, body });
+            }
             Token::Ident(_) => {
                 let name = self.ident()?;
+                if self.at(&Token::Equal) {
+                    self.pos += 1;
+                    let value = self.expression()?;
+                    return Ok(Statement::Assign { name, value });
+                }
                 self.expect(&Token::LParen)?;
                 let mut args = Vec::new();
                 if !self.at(&Token::RParen) {
@@ -143,6 +182,8 @@ impl Parser<'_> {
         let value = match self.current() {
             Token::String(text) => Expr::Text(text.clone()),
             Token::Number(number) => Expr::Number(number.clone()),
+            Token::Ident(name) if name == "true" => Expr::Bool(true),
+            Token::Ident(name) if name == "false" => Expr::Bool(false),
             Token::Ident(name) => Expr::Variable(name.clone()),
             other => return Err(format!("expected expression, found {other:?}")),
         };
