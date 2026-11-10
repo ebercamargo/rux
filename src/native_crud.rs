@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::Path, sync::{Arc, Mutex}};
+use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::{params, Connection};
 use serde_json::{json, Map, Value};
@@ -9,6 +9,7 @@ struct AppState {
     fields: Arc<Vec<(String, String)>>,
     html: Arc<String>,
     manifest: Arc<String>,
+    accepting: Arc<AtomicBool>,
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -41,6 +42,7 @@ async fn health_live() -> impl IntoResponse {
 }
 
 async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    if !state.accepting.load(Ordering::Acquire) { return Err(StatusCode::SERVICE_UNAVAILABLE); }
     let db = state.db.lock().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -121,7 +123,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let db = Connection::open(directory.join("records.sqlite")).map_err(|e| e.to_string())?;
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
-    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content) };
+    let accepting = Arc::new(AtomicBool::new(true));
+    let state = AppState { db: Arc::new(Mutex::new(db)), fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -134,7 +137,25 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let address = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite, no Node.js)");
-    axum::serve(listener, router).await.map_err(|e| e.to_string())
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = terminate.recv() => {},
+                    }
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            #[cfg(not(unix))]
+            { let _ = tokio::signal::ctrl_c().await; }
+            accepting.store(false, Ordering::Release);
+        })
+        .await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
