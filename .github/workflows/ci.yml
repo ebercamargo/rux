@@ -87,5 +87,6 @@ jobs:
           test -f Clientes/records.sqlite
           curl -fsS http://localhost:3000/health/live | grep -q UP
           curl -fsS http://localhost:3000/health/ready | grep -q UP
+          seq 1 50 | xargs -P 10 -I {} curl -fsS http://localhost:3000/health/ready > /dev/null
           curl -fsS http://localhost:3000/api/records > native-listed.json
           node -e 'if(require("./native-listed.json").length!==1)process.exit(1)'
