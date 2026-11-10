@@ -44,6 +44,17 @@ fn execute(body: &[Statement], variables: &mut HashMap<String, Binding>, output:
                     _ => return Err("when condition must be Bool".into()),
                 }
             }
+            Statement::LoopWhile { condition, body } => {
+                loop {
+                    if *budget == 0 { return Err("execution limit exceeded (100000 statements)".into()); }
+                    *budget -= 1;
+                    match evaluate(condition, variables)?.as_str() {
+                        "true" => execute(body, variables, output, budget)?,
+                        "false" => break,
+                        _ => return Err("loop while condition must be Bool".into()),
+                    }
+                }
+            }
             Statement::Loop { count, body } => {
                 let value = evaluate(count, variables)?;
                 let times: usize = value.parse().map_err(|_| "loop count must be a nonnegative integer")?;
@@ -117,6 +128,10 @@ mod tests {
     #[test]
     fn arithmetic_and_comparison() {
         assert_eq!(execute_source("app A { fn main() { var x = 2 + 3 * 4; when x == 14 { print(x / 2) } } }").unwrap(), "7\n");
+    }
+    #[test]
+    fn loop_while_updates_counter() {
+        assert_eq!(execute_source("app A { fn main() { var i = 0; loop while i < 3 { i = i + 1; print(i) } } }").unwrap(), "1\n2\n3\n");
     }
     #[test]
     fn division_by_zero_is_error() {
