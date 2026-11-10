@@ -8,6 +8,7 @@ const root = __dirname;
 const dataFile = path.join(root, "records.json");
 const port = Number(process.env.PORT || 3000);
 const fields = [__RUX_FIELDS__];
+const fieldTypes = {__RUX_TYPES__};
 const limit = 1024 * 1024;
 let records = [];
 try {
@@ -44,7 +45,14 @@ function validate(input) {
   const values = {};
   for (const field of fields) {
     if (typeof input[field] !== "string" || !input[field].trim() || input[field].length > 250) return null;
-    values[field] = input[field].trim();
+    const value = input[field].trim();
+    const type = fieldTypes[field] || "Text";
+    if (type === "Email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return null;
+    if (type === "Int" && !/^-?(0|[1-9]\d*)$/.test(value)) return null;
+    if (type === "Decimal" && !/^-?(0|[1-9]\d*)(\.\d+)?$/.test(value)) return null;
+    if (type === "Bool" && value !== "true" && value !== "false") return null;
+    if (type === "Date" && (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(value)) || new Date(value).toISOString().slice(0, 10) !== value)) return null;
+    values[field] = value;
   }
   return values;
 }
