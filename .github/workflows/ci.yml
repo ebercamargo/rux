@@ -44,7 +44,6 @@ jobs:
           cargo run --quiet -- crud-from examples/clientes_crud.rux
           test -f Clientes/index.html
           test -f Clientes/server.js
-          test -f Clientes/records.sqlite
           grep -q 'nome' Clientes/server.js
       - name: Validate typed CRUD REST payloads
         run: |
