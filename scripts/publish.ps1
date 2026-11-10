@@ -46,10 +46,12 @@ if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { Fail "Invalid ve
 $tag = "v$version"
 Write-Host "Preparing $tag"
 
-if (Get-RegistryVersion $version) {
-    Fail "rux-lang@$version is already published. A new version is required; npm never permits overwriting."
+$alreadyPublished = Get-RegistryVersion $version
+if ($alreadyPublished) {
+    Write-Host "rux-lang@$version is already published. Skipping duplicate publication; checking installed compiler."
 }
 
+if (-not $alreadyPublished) {
 Push-Location $packagePath
 try {
     Run npm @('test')
@@ -129,4 +131,24 @@ Push-Location $packagePath
 try {
     Run npm @('publish', '--access', 'public', '--tag', 'alpha', '--auth-type=web')
 } finally { Pop-Location }
-Write-Host "Published rux-lang@$version. Verify with: npm view rux-lang dist-tags"
+}
+Write-Host "Installing and verifying rux-lang@$version..."
+Run npm @('install', '-g', "rux-lang@$version", '--registry=https://registry.npmjs.org/')
+$npmRoot = (& npm root -g).Trim()
+if ($LASTEXITCODE -ne 0) { Fail 'Cannot find npm global root.' }
+$installed = (& npm list -g rux-lang --depth=0 --json | ConvertFrom-Json).dependencies.'rux-lang'.version
+if ($installed -ne $version) { Fail "npm installed $installed, expected $version." }
+$binary = Join-Path $npmRoot 'rux-lang/vendor/rux'
+if ($env:OS -eq 'Windows_NT') { $binary += '.exe' }
+if (-not (Test-Path $binary)) { Fail "Compiler not found: $binary. Check npm postinstall." }
+$actual = (& $binary --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { Fail "Compiler could not run: $binary" }
+$expected = "rux $version"
+if ($actual -ne $expected) {
+    Fail "npm package is $version but compiler reports '$actual'. This published version is defective. Merge the next version fix and rerun; do not overwrite the existing tag."
+}
+$cliVersion = (& rux --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $cliVersion -ne $expected) {
+    Fail "Compiler is correct ($actual), but rux command reports '$cliVersion'. Check Get-Command rux -All."
+}
+Write-Host "SUCCESS: npm and RUX compiler both report $version."
