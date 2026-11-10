@@ -1,0 +1,42 @@
+{
+  "name": "rux-language",
+  "displayName": "RUX Language",
+  "description": "Syntax highlighting and editor basics for RUX",
+  "version": "0.0.1",
+  "publisher": "rux-language",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rux",
+        "aliases": [
+          "RUX",
+          "rux"
+        ],
+        "extensions": [
+          ".rux"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rux",
+        "scopeName": "source.rux",
+        "path": "./syntaxes/rux.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "rux",
+        "path": "./snippets/rux.code-snippets"
+      }
+    ]
+  }
+}
