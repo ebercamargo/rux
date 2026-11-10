@@ -2,6 +2,24 @@
 
 Este recurso ainda nao esta publicado no npm e nao altera versao nem tags.
 
+## Definir o CRUD em RUX (novo prototipo)
+
+O arquivo `examples/clientes_crud.rux` usa `app` e `data` com campos declarativos:
+
+```rux
+app Clientes {
+    data Cliente {
+        nome: Text
+        email: Email
+        telefone: Text
+    }
+}
+```
+
+Gere a aplicacao com `cargo run -- crud-from examples/clientes_crud.rux`, depois execute `cd Clientes` e `node server.js`. O resultado e acessivel em http://localhost:3000.
+
+**Limitacao importante:** o parser declarativo e separado do interpretador executavel; tipos como `Int`, `Email` e `Date` sao aceitos como metadados, mas ainda nao produzem validacao especifica, armazenamento tipado ou migracoes SQL. Os campos gerados sao tratados como texto. Nao usar em producao.
+
 ## Teste local (codigo-fonte atualizado)
 
 Requer Rust/Cargo para compilar o projeto RUX e Node.js para executar o servidor gerado.
