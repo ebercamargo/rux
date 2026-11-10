@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::parser::{Expr, Program, Statement};
+use crate::lexer::Token;
 
 #[derive(Clone)]
 struct Binding { value: String, mutable: bool }
@@ -58,6 +59,30 @@ fn evaluate(expr: &Expr, variables: &HashMap<String, Binding>) -> Result<String,
     match expr {
         Expr::Text(value) | Expr::Number(value) => Ok(value.clone()),
         Expr::Bool(value) => Ok(value.to_string()),
+        Expr::Binary { left, op, right } => {
+            let a = evaluate(left, variables)?;
+            let b = evaluate(right, variables)?;
+            if matches!(op, Token::EqualEqual | Token::BangEqual) {
+                return Ok((if matches!(op, Token::EqualEqual) { a == b } else { a != b }).to_string());
+            }
+            if matches!(op, Token::Plus) && (!a.parse::<i64>().is_ok() || !b.parse::<i64>().is_ok()) {
+                return Ok(format!("{a}{b}"));
+            }
+            let x: i64 = a.parse().map_err(|_| "arithmetic requires integer operands")?;
+            let y: i64 = b.parse().map_err(|_| "arithmetic requires integer operands")?;
+            let numeric = match op {
+                Token::Plus => x.checked_add(y),
+                Token::Minus => x.checked_sub(y),
+                Token::Star => x.checked_mul(y),
+                Token::Slash => x.checked_div(y),
+                Token::Less => return Ok((x < y).to_string()),
+                Token::Greater => return Ok((x > y).to_string()),
+                Token::LessEqual => return Ok((x <= y).to_string()),
+                Token::GreaterEqual => return Ok((x >= y).to_string()),
+                _ => return Err("unsupported operator".into()),
+            };
+            numeric.map(|n| n.to_string()).ok_or_else(|| "integer overflow or division by zero".into())
+        },
         Expr::Variable(name) => variables.get(name).map(|b| b.value.clone()).ok_or_else(|| format!("undefined variable: {name}")),
     }
 }
@@ -88,6 +113,14 @@ mod tests {
     #[test]
     fn counted_loop() {
         assert_eq!(execute_source("app A { fn main() { loop 3 { print(\"Hi\") } } }").unwrap(), "Hi\nHi\nHi\n");
+    }
+    #[test]
+    fn arithmetic_and_comparison() {
+        assert_eq!(execute_source("app A { fn main() { var x = 2 + 3 * 4; when x == 14 { print(x / 2) } } }").unwrap(), "7\n");
+    }
+    #[test]
+    fn division_by_zero_is_error() {
+        assert!(execute_source("app A { fn main() { print(5 / 0) } }").is_err());
     }
     #[test]
     fn rejects_undefined_variable() {
