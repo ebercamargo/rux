@@ -67,9 +67,20 @@ fn execute_file(command: &str, path: &str) {
     }
 }
 
+fn help() {
+    println!("RUX {}", env!("CARGO_PKG_VERSION"));
+    println!("Usage: rux <command> [file.rux]");
+    println!("Commands: dev, run, start, check, new, crud, crud-from");
+    println!("  dev [file.rux]    Development execution (no hot reload yet)");
+    println!("  start [file.rux]  Start application");
+    println!("  --version        Print version");
+    println!("  --help           Show this help");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
+        [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rux {}", env!("CARGO_PKG_VERSION"));
         }
@@ -91,14 +102,14 @@ fn main() {
                 process::exit(1);
             }
         }
-        [_, command] if command == "check" || command == "run" => {
+        [_, command] if command == "check" || command == "run" || command == "start" || command == "dev" => {
             execute_file(command, "main.rux");
         }
         [_, command, path] if command == "check" || command == "run" => {
             execute_file(command, path);
         }
         _ => {
-            eprintln!("Usage: rux --version | rux new <project> | rux check [file.rux] | rux run [file.rux] | rux crud <name> <field> [field...] | rux crud-from <schema.rux>");
+            help();
             process::exit(2);
         }
     }

@@ -54,7 +54,7 @@ label{display:grid;gap:6px;font-weight:600}input{width:100%;padding:12px;border:
 button{padding:11px 15px;border:0;border-radius:8px;background:#4d49bd;color:white;font:inherit;cursor:pointer}
 button.secondary{background:#596273}button.danger{background:#b5263d}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-#search{max-width:320px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px;border-bottom:1px solid #e5e7ee}
+#search{max-width:320px}.pager{display:flex;align-items:center;gap:12px;justify-content:flex-end;margin-top:14px}button:disabled{opacity:.5;cursor:not-allowed}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px;border-bottom:1px solid #e5e7ee}
 .table-scroll{overflow-x:auto}#status{min-height:24px}button:focus-visible,input:focus-visible{outline:3px solid #aaa5ff}
 @media(max-width:640px){body{padding:12px}section{padding:14px}th,td{padding:9px}}
 </style>
@@ -63,7 +63,7 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 <header><h1>CRUD __RUX_TITLE__</h1><p>RUX • Cadastro multiplataforma no navegador</p></header>
 <section><h2 id="form-title">Novo registro</h2><form id="record-form"></form><p id="status" role="status" aria-live="polite"></p></section>
 <section><div class="toolbar"><h2>Registros</h2><input id="search" type="search" placeholder="Pesquisar..." aria-label="Pesquisar registros"></div>
-<div class="table-scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div></section>
+<div class="table-scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div><div class="pager"><button id="previous" type="button" class="secondary">Anterior</button><span id="page-label">Página 1</span><button id="next" type="button" class="secondary">Próxima</button></div></section>
 </main>
 <script>
 "use strict";
@@ -75,6 +75,8 @@ const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
 let records=[];
+let cursors=[null],pageIndex=0,hasMore=false,searchTimer=null,loadVersion=0;
+const pageSize=50;
 const remote=location.protocol==="http:"||location.protocol==="https:";
 try{const stored=JSON.parse(localStorage.getItem(key)||"[]");if(Array.isArray(stored))records=stored;}
 catch(e){status.textContent="Não foi possível ler os dados locais.";}
@@ -84,7 +86,26 @@ async function request(method,url,payload){
  if(!response.ok)throw Error("HTTP "+response.status);
  return response.json();
 }
-async function load(){if(!remote)return;try{records=await request("GET","/api/records");render();}catch(e){status.textContent="Não foi possível acessar a API.";}}
+async function load(){
+ if(!remote)return;
+ const version=++loadVersion;
+ const params=new URLSearchParams({limit:String(pageSize),q:document.getElementById("search").value});
+ if(cursors[pageIndex]!==null)params.set("before",String(cursors[pageIndex]));
+ try{
+  const result=await request("GET","/api/records?"+params.toString());
+  if(version!==loadVersion)return;
+  records=result;hasMore=result.length===pageSize;
+  render();
+ }catch(e){if(version===loadVersion)status.textContent="Não foi possível acessar a API.";}
+}
+function resetPages(){pageIndex=0;cursors=[null];load();}
+document.getElementById("previous").addEventListener("click",()=>{if(pageIndex>0){pageIndex--;load();}});
+document.getElementById("next").addEventListener("click",()=>{
+ if(!hasMore||!records.length)return;
+ const cursor=records[records.length-1]._cursor;
+ if(!Number.isSafeInteger(cursor))return;
+ cursors[pageIndex+1]=cursor;pageIndex++;load();
+});
 
 function element(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e;}
 for(const field of fields){
@@ -104,7 +125,7 @@ form.addEventListener("submit",async event=>{
  const values=Object.fromEntries(fields.map(f=>[f,form.elements.namedItem(f).value.trim()]));
  if(fields.some(f=>!values[f])){status.textContent="Preencha todos os campos.";return;}
  const before=records.map(r=>({...r}));
- if(remote){try{if(editing!==null){await request("PUT","/api/records/"+editing,values);}else{await request("POST","/api/records",values);}status.textContent=editing===null?"Registro criado.":"Registro atualizado.";reset();await load();}catch(e){status.textContent="Erro ao salvar no servidor: "+e.message;}return;}
+ if(remote){try{if(editing!==null){await request("PUT","/api/records/"+editing,values);}else{await request("POST","/api/records",values);}status.textContent=editing===null?"Registro criado.":"Registro atualizado.";reset();resetPages();}catch(e){status.textContent="Erro ao salvar no servidor: "+e.message;}return;}
  if(editing!==null){const item=records.find(r=>r.id===editing);if(!item)return;Object.assign(item,values);}
  else{records.push({id:crypto.randomUUID(),...values});}
  if(!persist()){records=before;return;}
@@ -115,7 +136,10 @@ function render(){
  head.replaceChildren();body.replaceChildren();
  const tr=element("tr");for(const f of [...fields,"Ações"])tr.append(element("th",f));head.append(tr);
  const term=document.getElementById("search").value.toLocaleLowerCase("pt-BR");
- const filtered=records.filter(r=>fields.some(f=>String(r[f]||"").toLocaleLowerCase("pt-BR").includes(term)));
+ const filtered=remote?records:records.filter(r=>fields.some(f=>String(r[f]||"").toLocaleLowerCase("pt-BR").includes(term)));
+ document.getElementById("previous").disabled=pageIndex===0;
+ document.getElementById("next").disabled=remote?!hasMore:records.length<=pageSize;
+ document.getElementById("page-label").textContent="Página "+(pageIndex+1);
  if(!filtered.length){const row=element("tr"),cell=element("td","Nenhum registro encontrado.");cell.colSpan=fields.length+1;row.append(cell);body.append(row);return;}
  for(const record of filtered){
   const row=element("tr");for(const f of fields)row.append(element("td",String(record[f]||"")));
@@ -123,11 +147,11 @@ function render(){
   const edit=element("button","Editar");edit.type="button";edit.className="secondary";
   edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
   const remove=element("button","Excluir");remove.type="button";remove.className="danger";
-  remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";await load();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
+  remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";resetPages();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
   actions.append(edit,remove);cell.append(actions);row.append(cell);body.append(row);
  }
 }
-document.getElementById("search").addEventListener("input",render);
+document.getElementById("search").addEventListener("input",()=>{if(!remote){render();return;}clearTimeout(searchTimer);searchTimer=setTimeout(resetPages,250);});
 render();load();
 </script></body></html>"##;
 

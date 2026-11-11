@@ -1,8 +1,11 @@
-use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}};
 use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
+use tokio::sync::Semaphore;
+use std::time::{Duration, Instant};
+use axum::{middleware::{self, Next}, extract::Request};
 
 #[derive(Clone)]
 struct AppState {
@@ -11,6 +14,14 @@ struct AppState {
     html: Arc<String>,
     manifest: Arc<String>,
     accepting: Arc<AtomicBool>,
+    api_slots: Arc<Semaphore>,
+    waiting_slots: Arc<Semaphore>,
+    api_wait: Duration,
+    db_slots: Arc<Semaphore>,
+    db_wait: Duration,
+    requests_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+    request_duration_micros: Arc<AtomicU64>,
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -38,12 +49,62 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
     Ok(result)
 }
 
+async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if !state.accepting.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let permit = if let Ok(permit) = state.api_slots.clone().try_acquire_owned() {
+        permit
+    } else {
+        let waiting = match state.waiting_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                state.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        };
+        let result = tokio::time::timeout(state.api_wait, state.api_slots.clone().acquire_owned()).await;
+        drop(waiting);
+        match result {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => {
+                state.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            },
+        }
+    };
+    let start = Instant::now();
+    let response = next.run(request).await;
+    state.request_duration_micros.fetch_add(start.elapsed().as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    drop(permit);
+    Ok(response)
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "requests_total": state.requests_total.load(Ordering::Relaxed),
+        "rejected_total": state.rejected_total.load(Ordering::Relaxed),
+        "request_duration_micros_total": state.request_duration_micros.load(Ordering::Relaxed),
+        "api_slots_available": state.api_slots.available_permits(),
+        "queued_slots_available": state.waiting_slots.available_permits()
+    }))
+}
+
 async fn health_live() -> impl IntoResponse {
     Json(json!({"status": "UP"}))
 }
 
+async fn acquire_db(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
+    tokio::time::timeout(state.db_wait, state.db_slots.clone().acquire_owned())
+        .await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
 async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     if !state.accepting.load(Ordering::Acquire) { return Err(StatusCode::SERVICE_UNAVAILABLE); }
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
@@ -64,16 +125,33 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
 struct Page {
     limit: Option<u32>,
     before: Option<i64>,
+    q: Option<String>,
+    field: Option<String>,
 }
 
 async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
+    let query = page.q.unwrap_or_default();
+    if query.len() > 250 { return Err(StatusCode::BAD_REQUEST); }
+    let field = page.field.unwrap_or_default();
+    if !field.is_empty() && !state.fields.iter().any(|(name, _)| name == &field) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
+        let mut stmt = db.prepare(
+            "SELECT rowid, id, payload FROM records
+             WHERE rowid < ?1
+               AND (?3 = '' OR EXISTS (
+                 SELECT 1 FROM json_each(payload)
+                 WHERE (?4 = '' OR json_each.key = ?4)
+                   AND instr(lower(CAST(json_each.value AS TEXT)), lower(?3)) > 0
+               ))
+             ORDER BY rowid DESC LIMIT ?2")
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt.query_map(params![before, limit], |row| {
+        let rows = stmt.query_map(params![before, limit, query, field], |row| {
             let cursor: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             let payload: String = row.get(2)?;
@@ -93,6 +171,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
 
 async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let id = uuid::Uuid::new_v4().to_string();
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -105,6 +184,7 @@ async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Resu
 
 async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>, Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
@@ -116,6 +196,7 @@ async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
 }
 
 async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Result<impl IntoResponse, StatusCode> {
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
@@ -134,12 +215,42 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .map_err(|e| format!("cannot read manifest: {e}"))?;
     let manager = SqliteConnectionManager::file(directory.join("records.sqlite"))
         .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout=5000;"));
-    let db = r2d2::Pool::builder().max_size(8).build(manager).map_err(|e| e.to_string())?;
+    let pool_size: u32 = std::env::var("RUX_DB_POOL_SIZE")
+        .unwrap_or_else(|_| "8".into())
+        .parse().map_err(|_| "RUX_DB_POOL_SIZE must be an integer".to_string())?;
+    if !(1..=128).contains(&pool_size) {
+        return Err("RUX_DB_POOL_SIZE must be between 1 and 128".into());
+    }
+    let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
     db.get().map_err(|e| e.to_string())?
         .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
+    let max_requests: usize = std::env::var("RUX_MAX_CONCURRENT_REQUESTS")
+        .unwrap_or_else(|_| "256".into())
+        .parse().map_err(|_| "RUX_MAX_CONCURRENT_REQUESTS must be an integer".to_string())?;
+    if !(1..=100_000).contains(&max_requests) {
+        return Err("RUX_MAX_CONCURRENT_REQUESTS must be between 1 and 100000".into());
+    }
+    let max_waiting: usize = std::env::var("RUX_MAX_QUEUED_REQUESTS")
+        .unwrap_or_else(|_| "512".into())
+        .parse().map_err(|_| "RUX_MAX_QUEUED_REQUESTS must be an integer".to_string())?;
+    if max_waiting > 100_000 {
+        return Err("RUX_MAX_QUEUED_REQUESTS must be between 0 and 100000".into());
+    }
+    let wait_ms: u64 = std::env::var("RUX_API_QUEUE_WAIT_MS")
+        .unwrap_or_else(|_| "50".into())
+        .parse().map_err(|_| "RUX_API_QUEUE_WAIT_MS must be an integer".to_string())?;
+    if wait_ms > 10_000 {
+        return Err("RUX_API_QUEUE_WAIT_MS must be between 0 and 10000".into());
+    }
+    let db_wait_ms: u64 = std::env::var("RUX_DB_WAIT_MS")
+        .unwrap_or_else(|_| "2000".into())
+        .parse().map_err(|_| "RUX_DB_WAIT_MS must be an integer".to_string())?;
+    if db_wait_ms > 60_000 {
+        return Err("RUX_DB_WAIT_MS must be between 0 and 60000".into());
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -148,7 +259,13 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .route("/manifest.webmanifest", get(manifest))
         .route("/api/records", get(list).post(create))
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(state.clone(), limit_api))
+        .with_state(state.clone());
+    let router = if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true") {
+        router.route("/metrics", get(metrics).with_state(state))
+    } else {
+        router
+    };
     let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
         .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
@@ -180,6 +297,29 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn db_admission_rejects_when_saturated() {
+        let state = AppState {
+            db: r2d2::Pool::builder().max_size(1).build(SqliteConnectionManager::memory()).unwrap(),
+            fields: Arc::new(vec![]),
+            html: Arc::new(String::new()),
+            manifest: Arc::new(String::new()),
+            accepting: Arc::new(AtomicBool::new(true)),
+            api_slots: Arc::new(Semaphore::new(1)),
+            waiting_slots: Arc::new(Semaphore::new(1)),
+            api_wait: Duration::from_millis(1),
+            db_slots: Arc::new(Semaphore::new(1)),
+            db_wait: Duration::from_millis(1),
+            requests_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+            request_duration_micros: Arc::new(AtomicU64::new(0)),
+        };
+        let permit = acquire_db(&state).await.unwrap();
+        assert!(matches!(acquire_db(&state).await, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        drop(permit);
+        assert!(acquire_db(&state).await.is_ok());
+    }
+
     #[test]
     fn validates_typed_payloads() {
         let fields = vec![("email".into(), "Email".into()), ("age".into(), "Int".into())];
