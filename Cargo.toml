@@ -14,3 +14,6 @@ uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+
+postgres = "0.19"
+r2d2_postgres = "0.18"
