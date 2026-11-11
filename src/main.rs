@@ -12,22 +12,7 @@ fn create_project(name: &str) -> Result<(), String> {
     }
     fs::create_dir(directory).map_err(|e| format!("cannot create project: {e}"))?;
     let app_name = name.replace('-', "_");
-    let source = format!("app {app_name} {{\n    fn help() {
-    println!("RUX {}", env!("CARGO_PKG_VERSION"));
-    println!("Usage: rux <command> [file.rux]");
-    println!("Commands:");
-    println!("  dev [file.rux]       Run in development mode (file watching not yet available)");
-    println!("  run [file.rux]       Run an application");
-    println!("  start [file.rux]     Start an application");
-    println!("  check [file.rux]     Validate an application");
-    println!("  new <project>        Create a project");
-    println!("  crud <name> <fields> Generate a CRUD project");
-    println!("  crud-from <file>     Generate CRUD from schema");
-    println!("  --version           Print version");
-    println!("  --help              Show this help");
-}
-
-fn main() {{\n        print(\"Hello, RUX!\")\n    }}\n}}\n");
+    let source = format!("app {app_name} {{\\n    fn main() {{\\n        print(\\\"Hello, RUX!\\\")\\n    }}\\n}}\\n");
     fs::write(directory.join("main.rux"), source).map_err(|e| format!("cannot create main.rux: {e}"))?;
     println!("Created RUX project: {name}");
     println!("  cd {name}");
@@ -80,6 +65,16 @@ fn execute_file(command: &str, path: &str) {
             }
         }
     }
+}
+
+fn help() {
+    println!("RUX {}", env!("CARGO_PKG_VERSION"));
+    println!("Usage: rux <command> [file.rux]");
+    println!("Commands: dev, run, start, check, new, crud, crud-from");
+    println!("  dev [file.rux]    Development execution (no hot reload yet)");
+    println!("  start [file.rux]  Start application");
+    println!("  --version        Print version");
+    println!("  --help           Show this help");
 }
 
 fn main() {
