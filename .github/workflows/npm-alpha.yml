@@ -1,0 +1,65 @@
+name: Publish RUX alpha to npm
+on:
+  push:
+    tags:
+      - 'v*-alpha.*'
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32
+            binary: target/release/rux.exe
+          - os: ubuntu-latest
+            target: linux
+            binary: target/release/rux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rux-${{ matrix.target }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          name: rux-win32
+          path: npm/native/win32
+      - uses: actions/download-artifact@v4
+        with:
+          name: rux-linux
+          path: npm/native/linux
+      - name: Validate release version and binary layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          package_version="$(node -p 'require("./npm/package.json").version')"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "$tag" = "$package_version"
+          test "$tag" = "$cargo_version"
+          test -s npm/native/win32/rux.exe
+          test -s npm/native/linux/rux
+          chmod +x npm/native/linux/rux
+          npm pack --dry-run --prefix npm
+      - name: Publish alpha with npm trusted publishing
+        working-directory: npm
+        run: npm publish --tag alpha --provenance --access public
