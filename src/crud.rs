@@ -11,6 +11,21 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
     create_typed(name, &typed)
 }
 
+pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), String> {
+    if !valid_name(name) { return Err("Invalid CRUD name".into()); }
+    if typed.is_empty() || typed.len() > 20 { return Err("CRUD must declare 1-20 fields".into()); }
+    let mut seen = std::collections::HashSet::new();
+    if typed.iter().any(|(field, _)| !valid_name(field) || field == "id" || !seen.insert(field)) {
+        return Err("Invalid or duplicate CRUD field".into());
+    }
+    let directory = Path::new(name);
+    if !directory.is_dir() { return Err(format!("CRUD directory does not exist: {name}")); }
+    let fields_js = typed.iter().map(|(field, _)| format!("\\\"{field}\\\"")).collect::<Vec<_>>().join(",");
+    let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
+    fs::write(directory.join("index.html"), html).map_err(|e| format!("cannot refresh UI: {e}"))?;
+    Ok(())
+}
+
 pub fn create_typed(name: &str, typed: &[(String, String)]) -> Result<(), String> {
     let fields = typed.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     if !valid_name(name) { return Err("CRUD name must contain letters, digits or underscore and start with a letter".into()); }
