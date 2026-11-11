@@ -12,7 +12,7 @@ fn create_project(name: &str) -> Result<(), String> {
     }
     fs::create_dir(directory).map_err(|e| format!("cannot create project: {e}"))?;
     let app_name = name.replace('-', "_");
-    let source = format!("app {app_name} {{\\n    fn main() {{\\n        print(\\\"Hello, RUX!\\\")\\n    }}\\n}}\\n");
+    let source = format!("app {app_name} {{\n    fn main() {{\n        print(\"Hello, RUX!\")\n    }}\n}}\n");
     fs::write(directory.join("main.rux"), source).map_err(|e| format!("cannot create main.rux: {e}"))?;
     println!("Created RUX project: {name}");
     println!("  cd {name}");
