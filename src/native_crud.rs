@@ -17,6 +17,8 @@ struct AppState {
     api_slots: Arc<Semaphore>,
     waiting_slots: Arc<Semaphore>,
     api_wait: Duration,
+    db_slots: Arc<Semaphore>,
+    db_wait: Duration,
     requests_total: Arc<AtomicU64>,
     rejected_total: Arc<AtomicU64>,
     request_duration_micros: Arc<AtomicU64>,
@@ -94,8 +96,15 @@ async fn health_live() -> impl IntoResponse {
     Json(json!({"status": "UP"}))
 }
 
+async fn acquire_db(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, StatusCode> {
+    tokio::time::timeout(state.db_wait, state.db_slots.clone().acquire_owned())
+        .await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
 async fn health_ready(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     if !state.accepting.load(Ordering::Acquire) { return Err(StatusCode::SERVICE_UNAVAILABLE); }
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         db.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
@@ -214,8 +223,14 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if wait_ms > 10_000 {
         return Err("RUX_API_QUEUE_WAIT_MS must be between 0 and 10000".into());
     }
+    let db_wait_ms: u64 = std::env::var("RUX_DB_WAIT_MS")
+        .unwrap_or_else(|_| "2000".into())
+        .parse().map_err(|_| "RUX_DB_WAIT_MS must be an integer".to_string())?;
+    if db_wait_ms > 60_000 {
+        return Err("RUX_DB_WAIT_MS must be between 0 and 60000".into());
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
