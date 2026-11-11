@@ -134,7 +134,13 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .map_err(|e| format!("cannot read manifest: {e}"))?;
     let manager = SqliteConnectionManager::file(directory.join("records.sqlite"))
         .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout=5000;"));
-    let db = r2d2::Pool::builder().max_size(8).build(manager).map_err(|e| e.to_string())?;
+    let pool_size: u32 = std::env::var("RUX_DB_POOL_SIZE")
+        .unwrap_or_else(|_| "8".into())
+        .parse().map_err(|_| "RUX_DB_POOL_SIZE must be an integer".to_string())?;
+    if !(1..=128).contains(&pool_size) {
+        return Err("RUX_DB_POOL_SIZE must be between 1 and 128".into());
+    }
+    let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
     db.get().map_err(|e| e.to_string())?
         .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
