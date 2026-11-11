@@ -1,0 +1,27 @@
+{
+  "name": "rux",
+  "version": "0.1.0-alpha.6",
+  "description": "RUX language CLI (native Rust executable)",
+  "license": "Apache-2.0",
+  "bin": {
+    "rux": "bin/rux.cjs"
+  },
+  "files": [
+    "bin/",
+    "native/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32",
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "alpha"
+  }
+}
