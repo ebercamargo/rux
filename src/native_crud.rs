@@ -1,10 +1,10 @@
-use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}};
 use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
 use tokio::sync::Semaphore;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use axum::{middleware::{self, Next}, extract::Request};
 
 #[derive(Clone)]
@@ -17,6 +17,9 @@ struct AppState {
     api_slots: Arc<Semaphore>,
     waiting_slots: Arc<Semaphore>,
     api_wait: Duration,
+    requests_total: Arc<AtomicU64>,
+    rejected_total: Arc<AtomicU64>,
+    request_duration_micros: Arc<AtomicU64>,
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -45,25 +48,46 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
 }
 
 async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
     if !state.accepting.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let permit = if let Ok(permit) = state.api_slots.clone().try_acquire_owned() {
         permit
     } else {
-        let waiting = state.waiting_slots.clone().try_acquire_owned()
-            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+        let waiting = match state.waiting_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                state.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+        };
         let result = tokio::time::timeout(state.api_wait, state.api_slots.clone().acquire_owned()).await;
         drop(waiting);
         match result {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-            Err(_) => return Err(StatusCode::TOO_MANY_REQUESTS),
+            Err(_) => {
+                state.rejected_total.fetch_add(1, Ordering::Relaxed);
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            },
         }
     };
+    let start = Instant::now();
     let response = next.run(request).await;
+    state.request_duration_micros.fetch_add(start.elapsed().as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
     drop(permit);
     Ok(response)
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "requests_total": state.requests_total.load(Ordering::Relaxed),
+        "rejected_total": state.rejected_total.load(Ordering::Relaxed),
+        "request_duration_micros_total": state.request_duration_micros.load(Ordering::Relaxed),
+        "active_requests": state.api_slots.available_permits(),
+        "queued_slots_available": state.waiting_slots.available_permits()
+    }))
 }
 
 async fn health_live() -> impl IntoResponse {
@@ -191,10 +215,11 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         return Err("RUX_API_QUEUE_WAIT_MS must be between 0 and 10000".into());
     }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
+        .route("/metrics", get(metrics))
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/manifest.webmanifest", get(manifest))
