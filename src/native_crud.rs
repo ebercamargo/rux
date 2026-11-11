@@ -208,6 +208,8 @@ async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>)
 }
 
 pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), String> {
+    super::database::selected_backend(std::env::var("RUX_DATABASE_URL").ok().as_deref())
+        .map_err(|error| format!("RUX_DATABASE_URL: {error}"))?;
     let directory = Path::new(name);
     if !directory.exists() {
         super::crud::create_typed(name, &fields)?;
