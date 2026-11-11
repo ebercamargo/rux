@@ -13,7 +13,8 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
 
 fn render_typed_ui(name: &str, typed: &[(String, String)]) -> String {
     let fields_js = typed.iter().map(|(field, _)| format!("\"{field}\"")).collect::<Vec<_>>().join(",");
-    TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js)
+    let types_js = typed.iter().map(|(field, ty)| format!("\"{field}\":\"{ty}\"")).collect::<Vec<_>>().join(",");
+    TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js).replace("__RUX_TYPES__", &types_js)
 }
 
 pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), String> {
@@ -45,7 +46,7 @@ pub fn create_typed(name: &str, typed: &[(String, String)]) -> Result<(), String
     let directory = Path::new(name);
     if directory.exists() { return Err(format!("Directory already exists: {name}")); }
     let fields_js = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(",");
-    let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
+    let html = render_typed_ui(name, typed);
     fs::create_dir(directory).map_err(|e| e.to_string())?;
     fs::write(directory.join("index.html"), html).map_err(|e| e.to_string())?;
     let types_js = typed.iter().map(|(field, ty)| format!("\"{field}\":\"{ty}\"")).collect::<Vec<_>>().join(",");
@@ -90,6 +91,8 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 <script>
 "use strict";
 const fields=[__RUX_FIELDS__];
+const fieldTypes={__RUX_TYPES__};
+function isoDate(value){const match=/^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
 const key="rux:crud:__RUX_TITLE__:v1";
 const form=document.getElementById("record-form");
 const body=document.getElementById("table-body");
@@ -133,6 +136,11 @@ function element(tag,text){const e=document.createElement(tag);if(text!==undefin
 for(const field of fields){
  const label=element("label",field);const input=document.createElement("input");
  input.name=field;input.required=true;input.maxLength=250;input.autocomplete="off";
+ if(fieldTypes[field]==="Date")input.type="date";
+ else if(fieldTypes[field]==="Email")input.type="email";
+ else if(fieldTypes[field]==="Int"){input.type="number";input.step="1";}
+ else if(fieldTypes[field]==="Decimal"){input.type="number";input.step="any";}
+ else if(fieldTypes[field]==="Bool"){input.pattern="true|false";input.title="Use true ou false";}
  label.append(input);form.append(label);
 }
 const controls=element("div");controls.className="actions";
@@ -167,7 +175,7 @@ function render(){
   const row=element("tr");for(const f of fields)row.append(element("td",String(record[f]||"")));
   const cell=element("td"),actions=element("div");actions.className="actions";
   const edit=element("button","Editar");edit.type="button";edit.className="secondary";
-  edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
+  edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=fieldTypes[f]==="Date"?isoDate(record[f]):record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
   const remove=element("button","Excluir");remove.type="button";remove.className="danger";
   remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";resetPages();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
   actions.append(edit,remove);cell.append(actions);row.append(cell);body.append(row);
@@ -191,6 +199,21 @@ mod tests {
         assert!(html.contains(r#"["nome","sobrenome","age"]"#));
         assert!(!html.contains(r#"\"nome\""#));
         assert!(!html.contains("__RUX_FIELDS__"));
+        assert!(!html.contains("__RUX_TYPES__"));
+    }
+    #[test]
+    fn typed_ui_renders_native_date_and_number_inputs() {
+        let fields = vec![
+            ("created".to_string(), "Date".to_string()),
+            ("amount".to_string(), "Decimal".to_string()),
+            ("email".to_string(), "Email".to_string()),
+        ];
+        let html = render_typed_ui("teste", &fields);
+        assert!(html.contains(r#""created":"Date""#));
+        assert!(html.contains(r#""amount":"Decimal""#));
+        assert!(html.contains(r#""email":"Email""#));
+        assert!(html.contains(r#"input.type="date""#));
+        assert!(html.contains("isoDate(record[f])"));
     }
     #[test]
     fn rejects_invalid_fields() {
