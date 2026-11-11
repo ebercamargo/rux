@@ -27,6 +27,9 @@ pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), St
     if !directory.is_dir() { return Err(format!("CRUD directory does not exist: {name}")); }
     let html = render_typed_ui(name, typed);
     fs::write(directory.join("index.html"), html).map_err(|e| format!("cannot refresh UI: {e}"))?;
+    let manifest = format!(r###"{{"name":"RUX {name}","short_name":"{name}","start_url":"/","display":"standalone","background_color":"#f5f6fa","theme_color":"#4d49bd"}}"###);
+    fs::write(directory.join("manifest.webmanifest"), manifest)
+        .map_err(|e| format!("cannot refresh manifest: {e}"))?;
     Ok(())
 }
 
