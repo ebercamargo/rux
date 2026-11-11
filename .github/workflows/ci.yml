@@ -90,3 +90,47 @@ jobs:
           seq 1 50 | xargs -P 10 -I {} curl -fsS http://localhost:3000/health/ready > /dev/null
           curl -fsS http://localhost:3000/api/records > native-listed.json
           node -e 'if(require("./native-listed.json").length!==1)process.exit(1)'
+
+      - name: Verify native CRUD search and safe schema refresh
+        run: |
+          set -eu
+          cat > ci_refresh.rux <<'RUX'
+          app CiRefresh {
+              data Cliente {
+                  nome: Text
+                  email: Email
+              }
+          }
+          RUX
+          cargo run --quiet -- run ci_refresh.rux > ci-refresh.log 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3000/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS -X POST -H 'Content-Type: application/json' -d '{"nome":"Alice","email":"alice@example.com"}' http://127.0.0.1:3000/api/records > ci-refresh-created.json
+          curl -fsS 'http://127.0.0.1:3000/api/records?q=Alice&field=nome' > ci-search.json
+          node -e 'if(require("./ci-search.json").length!==1)process.exit(1)'
+          curl -fsS 'http://127.0.0.1:3000/api/records?q=%27%20OR%201%3D1%20--' > ci-injection.json
+          node -e 'if(require("./ci-injection.json").length!==0)process.exit(1)'
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          cat > ci_refresh.rux <<'RUX'
+          app CiRefresh {
+              data Cliente {
+                  nome: Text
+                  email: Email
+                  telefone: Text
+              }
+          }
+          RUX
+          cargo run --quiet -- run ci_refresh.rux > ci-refresh-restarted.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3000/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          grep -q '"telefone"' CiRefresh/index.html
+          curl -fsS 'http://127.0.0.1:3000/api/records?q=Alice' > ci-persisted.json
+          node -e 'if(require("./ci-persisted.json").length!==1)process.exit(1)'
