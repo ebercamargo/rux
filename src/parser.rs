@@ -221,6 +221,14 @@ impl Parser<'_> {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        if self.at(&Token::Minus) {
+            self.pos += 1;
+            return Ok(Expr::Binary {
+                left: Box::new(Expr::Number("0".into())),
+                op: Token::Minus,
+                right: Box::new(self.primary()?),
+            });
+        }
         let value = match self.current() {
             Token::String(text) => Expr::Text(text.clone()),
             Token::Number(number) => Expr::Number(number.clone()),
@@ -268,6 +276,11 @@ mod tests {
         assert_eq!(program.functions[0].body.len(), 2);
     }
 
+    #[test]
+    fn parses_negative_numbers() {
+        let source = "app A { fn main() { let n = -42; print(n) } }";
+        assert!(parse(&lex(source).unwrap()).is_ok());
+    }
     #[test]
     fn rejects_missing_brace() {
         assert!(parse(&lex("app Hello { fn main() { print(\"Hi\") }").unwrap()).is_err());
