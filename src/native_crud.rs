@@ -85,7 +85,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         "requests_total": state.requests_total.load(Ordering::Relaxed),
         "rejected_total": state.rejected_total.load(Ordering::Relaxed),
         "request_duration_micros_total": state.request_duration_micros.load(Ordering::Relaxed),
-        "active_requests": state.api_slots.available_permits(),
+        "api_slots_available": state.api_slots.available_permits(),
         "queued_slots_available": state.waiting_slots.available_permits()
     }))
 }
@@ -219,14 +219,18 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
-        .route("/metrics", get(metrics))
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/manifest.webmanifest", get(manifest))
         .route("/api/records", get(list).post(create))
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
         .route_layer(middleware::from_fn_with_state(state.clone(), limit_api))
-        .with_state(state);
+        .with_state(state.clone());
+    let router = if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true") {
+        router.route("/metrics", get(metrics).with_state(state))
+    } else {
+        router
+    };
     let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
         .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
