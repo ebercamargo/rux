@@ -11,6 +11,11 @@ pub fn create(name: &str, fields: &[String]) -> Result<(), String> {
     create_typed(name, &typed)
 }
 
+fn render_typed_ui(name: &str, typed: &[(String, String)]) -> String {
+    let fields_js = typed.iter().map(|(field, _)| format!("\"{field}\"")).collect::<Vec<_>>().join(",");
+    TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js)
+}
+
 pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), String> {
     if !valid_name(name) { return Err("Invalid CRUD name".into()); }
     if typed.is_empty() || typed.len() > 20 { return Err("CRUD must declare 1-20 fields".into()); }
@@ -20,8 +25,7 @@ pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), St
     }
     let directory = Path::new(name);
     if !directory.is_dir() { return Err(format!("CRUD directory does not exist: {name}")); }
-    let fields_js = typed.iter().map(|(field, _)| format!("\"{field}\"")).collect::<Vec<_>>().join(",");
-    let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
+    let html = render_typed_ui(name, typed);
     fs::write(directory.join("index.html"), html).map_err(|e| format!("cannot refresh UI: {e}"))?;
     Ok(())
 }
@@ -173,6 +177,18 @@ render();load();
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refreshed_ui_renders_new_fields_as_valid_js_strings() {
+        let fields = vec![
+            ("nome".to_string(), "Text".to_string()),
+            ("sobrenome".to_string(), "Text".to_string()),
+            ("age".to_string(), "Decimal".to_string()),
+        ];
+        let html = render_typed_ui("teste", &fields);
+        assert!(html.contains(r#"["nome","sobrenome","age"]"#));
+        assert!(!html.contains(r#"\"nome\""#));
+        assert!(!html.contains("__RUX_FIELDS__"));
+    }
     #[test]
     fn rejects_invalid_fields() {
         assert!(create("../escape", &["nome".into()]).is_err());
