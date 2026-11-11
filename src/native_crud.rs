@@ -132,6 +132,13 @@ struct Page {
 async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
+    let query = page.q.unwrap_or_default();
+    if query.len() > 250 { return Err(StatusCode::BAD_REQUEST); }
+    let field = page.field.unwrap_or_default();
+    if !field.is_empty() && !state.fields.iter().any(|(name, _)| name == &field) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let mut stmt = db.prepare(
@@ -164,6 +171,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
 
 async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let id = uuid::Uuid::new_v4().to_string();
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -176,6 +184,7 @@ async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Resu
 
 async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>, Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
     let mut payload = Value::Object(validate(&input, &state.fields)?);
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
@@ -187,6 +196,7 @@ async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
 }
 
 async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Result<impl IntoResponse, StatusCode> {
+    let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
