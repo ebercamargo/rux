@@ -67,11 +67,51 @@ fn execute_file(command: &str, path: &str) {
     }
 }
 
+fn dev(path: &str) -> Result<(), String> {
+    use std::{process::Command, thread, time::Duration};
+    let executable = env::current_exe().map_err(|e| format!("cannot locate RUX executable: {e}"))?;
+    let mut last_source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let check = Command::new(&executable).args(["check", path]).status()
+        .map_err(|e| format!("cannot validate {path}: {e}"))?;
+    if !check.success() { return Err("Fix the RUX source errors before starting dev mode".into()); }
+    println!("RUX dev: watching {path} (Ctrl+C to stop)");
+    let mut child = Command::new(&executable).args(["run", path]).spawn()
+        .map_err(|e| format!("cannot start RUX application: {e}"))?;
+    loop {
+        thread::sleep(Duration::from_millis(400));
+        let source = match fs::read(path) {
+            Ok(source) => source,
+            Err(error) => {
+                eprintln!("RUX dev: cannot read {path}: {error}");
+                continue;
+            }
+        };
+        if source == last_source {
+            if let Ok(Some(status)) = child.try_wait() {
+                eprintln!("RUX dev: application exited ({status}); waiting for a file change");
+            }
+            continue;
+        }
+        last_source = source;
+        thread::sleep(Duration::from_millis(200));
+        let check = Command::new(&executable).args(["check", path]).status();
+        if !matches!(check, Ok(status) if status.success()) {
+            eprintln!("RUX dev: validation failed; keeping previous application running");
+            continue;
+        }
+        println!("RUX dev: source changed; restarting application");
+        let _ = child.kill();
+        let _ = child.wait();
+        child = Command::new(&executable).args(["run", path]).spawn()
+            .map_err(|e| format!("cannot restart RUX application: {e}"))?;
+    }
+}
+
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
     println!("Commands: dev, run, start, check, new, crud, crud-from");
-    println!("  dev [file.rux]    Development execution (no hot reload yet)");
+    println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
     println!("  --version        Print version");
     println!("  --help           Show this help");
@@ -102,10 +142,16 @@ fn main() {
                 process::exit(1);
             }
         }
-        [_, command] if command == "check" || command == "run" || command == "start" || command == "dev" => {
+        [_, command] if command == "dev" => {
+            if let Err(error) = dev("main.rux") { eprintln!("RUX dev error: {error}"); process::exit(1); }
+        }
+        [_, command, path] if command == "dev" => {
+            if let Err(error) = dev(path) { eprintln!("RUX dev error: {error}"); process::exit(1); }
+        }
+        [_, command] if command == "check" || command == "run" || command == "start" => {
             execute_file(command, "main.rux");
         }
-        [_, command, path] if command == "check" || command == "run" => {
+        [_, command, path] if command == "check" || command == "run" || command == "start" => {
             execute_file(command, path);
         }
         _ => {
