@@ -3,6 +3,8 @@ use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, respons
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
+use tokio::sync::Semaphore;
+use axum::{middleware::{self, Next}, extract::Request};
 
 #[derive(Clone)]
 struct AppState {
@@ -11,6 +13,7 @@ struct AppState {
     html: Arc<String>,
     manifest: Arc<String>,
     accepting: Arc<AtomicBool>,
+    api_slots: Arc<Semaphore>,
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -36,6 +39,17 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
         result.insert(name.clone(), Value::String(value.to_string()));
     }
     Ok(result)
+}
+
+async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
+    if !state.accepting.load(Ordering::Acquire) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let permit = state.api_slots.clone().try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let response = next.run(request).await;
+    drop(permit);
+    Ok(response)
 }
 
 async fn health_live() -> impl IntoResponse {
@@ -144,8 +158,14 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     db.get().map_err(|e| e.to_string())?
         .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
+    let max_requests: usize = std::env::var("RUX_MAX_CONCURRENT_REQUESTS")
+        .unwrap_or_else(|_| "256".into())
+        .parse().map_err(|_| "RUX_MAX_CONCURRENT_REQUESTS must be an integer".to_string())?;
+    if !(1..=100_000).contains(&max_requests) {
+        return Err("RUX_MAX_CONCURRENT_REQUESTS must be between 1 and 100000".into());
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -154,6 +174,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .route("/manifest.webmanifest", get(manifest))
         .route("/api/records", get(list).post(create))
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
+        .route_layer(middleware::from_fn_with_state(state.clone(), limit_api))
         .with_state(state);
     let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
