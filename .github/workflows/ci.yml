@@ -1,7 +1,7 @@
 name: Rust checks
 on:
   push:
-    branches: [main, develop]
+    branches: [main, develop, feat/v1-runtime-performance]
   pull_request:
 jobs:
   test:
