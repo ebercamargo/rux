@@ -335,8 +335,9 @@ mod tests {
             params!["two", r#"{"nome":"Bob","email":"bob@example.com"}"#]).unwrap();
         let count = |q: &str, field: &str| -> usize {
             let mut statement = db.prepare(LIST_SQL).unwrap();
-            statement.query_map(params![i64::MAX, 50, q, field], |row| row.get::<_, String>(1))
-                .unwrap().collect::<Result<Vec<_>, _>>().unwrap().len()
+            let rows = statement.query_map(params![i64::MAX, 50, q, field], |row| row.get::<_, String>(1))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            rows.len()
         };
         assert_eq!(count("Alice", ""), 1);
         assert_eq!(count("alice@", "email"), 1);
