@@ -121,6 +121,15 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "application/manifest+json")], (*state.manifest).clone())
 }
 
+const LIST_SQL: &str = "SELECT rowid, id, payload FROM records
+             WHERE rowid < ?1
+               AND (?3 = '' OR EXISTS (
+                 SELECT 1 FROM json_each(payload)
+                 WHERE (?4 = '' OR json_each.key = ?4)
+                   AND instr(lower(CAST(json_each.value AS TEXT)), lower(?3)) > 0
+               ))
+             ORDER BY rowid DESC LIMIT ?2";
+
 #[derive(serde::Deserialize)]
 struct Page {
     limit: Option<u32>,
@@ -141,15 +150,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut stmt = db.prepare(
-            "SELECT rowid, id, payload FROM records
-             WHERE rowid < ?1
-               AND (?3 = '' OR EXISTS (
-                 SELECT 1 FROM json_each(payload)
-                 WHERE (?4 = '' OR json_each.key = ?4)
-                   AND instr(lower(CAST(json_each.value AS TEXT)), lower(?3)) > 0
-               ))
-             ORDER BY rowid DESC LIMIT ?2")
+        let mut stmt = db.prepare(LIST_SQL)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let rows = stmt.query_map(params![before, limit, query, field], |row| {
             let cursor: i64 = row.get(0)?;
@@ -322,6 +323,27 @@ mod tests {
         assert!(matches!(acquire_db(&state).await, Err(StatusCode::SERVICE_UNAVAILABLE)));
         drop(permit);
         assert!(acquire_db(&state).await.is_ok());
+    }
+
+    #[test]
+    fn search_uses_bound_parameters_and_resists_sql_injection() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)",
+            params!["one", r#"{"nome":"Alice","email":"alice@example.com"}"#]).unwrap();
+        db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)",
+            params!["two", r#"{"nome":"Bob","email":"bob@example.com"}"#]).unwrap();
+        let count = |q: &str, field: &str| -> usize {
+            let mut statement = db.prepare(LIST_SQL).unwrap();
+            statement.query_map(params![i64::MAX, 50, q, field], |row| row.get::<_, String>(1))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap().len()
+        };
+        assert_eq!(count("Alice", ""), 1);
+        assert_eq!(count("alice@", "email"), 1);
+        assert_eq!(count("alice@", "nome"), 0);
+        assert_eq!(count("' OR 1=1 --", ""), 0);
+        assert_eq!(count("x'); DROP TABLE records; --", ""), 0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM records", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
     }
 
     #[test]
