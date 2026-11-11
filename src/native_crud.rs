@@ -208,7 +208,11 @@ async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>)
 
 pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), String> {
     let directory = Path::new(name);
-    if !directory.exists() { super::crud::create_typed(name, &fields)?; }
+    if !directory.exists() {
+        super::crud::create_typed(name, &fields)?;
+    } else {
+        super::crud::refresh_typed_ui(name, &fields)?;
+    }
     let html = std::fs::read_to_string(directory.join("index.html"))
         .map_err(|e| format!("cannot read generated UI: {e}"))?;
     let manifest_content = std::fs::read_to_string(directory.join("manifest.webmanifest"))
