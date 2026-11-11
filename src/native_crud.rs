@@ -15,6 +15,7 @@ struct AppState {
     manifest: Arc<String>,
     accepting: Arc<AtomicBool>,
     api_slots: Arc<Semaphore>,
+    waiting_slots: Arc<Semaphore>,
     api_wait: Duration,
 }
 
@@ -47,10 +48,18 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
     if !state.accepting.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let permit = match tokio::time::timeout(state.api_wait, state.api_slots.clone().acquire_owned()).await {
+    let permit = if let Ok(permit) = state.api_slots.clone().try_acquire_owned() {
+        permit
+    } else {
+        let waiting = state.waiting_slots.clone().try_acquire_owned()
+            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+        let result = tokio::time::timeout(state.api_wait, state.api_slots.clone().acquire_owned()).await;
+        drop(waiting);
+        match result {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-        Err(_) => return Err(StatusCode::TOO_MANY_REQUESTS),
+            Err(_) => return Err(StatusCode::TOO_MANY_REQUESTS),
+        }
     };
     let response = next.run(request).await;
     drop(permit);
@@ -169,6 +178,12 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if !(1..=100_000).contains(&max_requests) {
         return Err("RUX_MAX_CONCURRENT_REQUESTS must be between 1 and 100000".into());
     }
+    let max_waiting: usize = std::env::var("RUX_MAX_QUEUED_REQUESTS")
+        .unwrap_or_else(|_| "512".into())
+        .parse().map_err(|_| "RUX_MAX_QUEUED_REQUESTS must be an integer".to_string())?;
+    if max_waiting > 100_000 {
+        return Err("RUX_MAX_QUEUED_REQUESTS must be between 0 and 100000".into());
+    }
     let wait_ms: u64 = std::env::var("RUX_API_QUEUE_WAIT_MS")
         .unwrap_or_else(|_| "50".into())
         .parse().map_err(|_| "RUX_API_QUEUE_WAIT_MS must be an integer".to_string())?;
@@ -176,7 +191,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         return Err("RUX_API_QUEUE_WAIT_MS must be between 0 and 10000".into());
     }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), api_wait: Duration::from_millis(wait_ms) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
