@@ -12,7 +12,22 @@ fn create_project(name: &str) -> Result<(), String> {
     }
     fs::create_dir(directory).map_err(|e| format!("cannot create project: {e}"))?;
     let app_name = name.replace('-', "_");
-    let source = format!("app {app_name} {{\n    fn main() {{\n        print(\"Hello, RUX!\")\n    }}\n}}\n");
+    let source = format!("app {app_name} {{\n    fn help() {
+    println!("RUX {}", env!("CARGO_PKG_VERSION"));
+    println!("Usage: rux <command> [file.rux]");
+    println!("Commands:");
+    println!("  dev [file.rux]       Run in development mode (file watching not yet available)");
+    println!("  run [file.rux]       Run an application");
+    println!("  start [file.rux]     Start an application");
+    println!("  check [file.rux]     Validate an application");
+    println!("  new <project>        Create a project");
+    println!("  crud <name> <fields> Generate a CRUD project");
+    println!("  crud-from <file>     Generate CRUD from schema");
+    println!("  --version           Print version");
+    println!("  --help              Show this help");
+}
+
+fn main() {{\n        print(\"Hello, RUX!\")\n    }}\n}}\n");
     fs::write(directory.join("main.rux"), source).map_err(|e| format!("cannot create main.rux: {e}"))?;
     println!("Created RUX project: {name}");
     println!("  cd {name}");
@@ -70,6 +85,7 @@ fn execute_file(command: &str, path: &str) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
+        [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rux {}", env!("CARGO_PKG_VERSION"));
         }
@@ -91,14 +107,14 @@ fn main() {
                 process::exit(1);
             }
         }
-        [_, command] if command == "check" || command == "run" => {
+        [_, command] if command == "check" || command == "run" || command == "start" || command == "dev" => {
             execute_file(command, "main.rux");
         }
         [_, command, path] if command == "check" || command == "run" => {
             execute_file(command, path);
         }
         _ => {
-            eprintln!("Usage: rux --version | rux new <project> | rux check [file.rux] | rux run [file.rux] | rux crud <name> <field> [field...] | rux crud-from <schema.rux>");
+            help();
             process::exit(2);
         }
     }
