@@ -125,6 +125,8 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
 struct Page {
     limit: Option<u32>,
     before: Option<i64>,
+    q: Option<String>,
+    field: Option<String>,
 }
 
 async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
@@ -132,9 +134,17 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
     let before = page.before.unwrap_or(i64::MAX);
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut stmt = db.prepare("SELECT rowid, id, payload FROM records WHERE rowid < ?1 ORDER BY rowid DESC LIMIT ?2")
+        let mut stmt = db.prepare(
+            "SELECT rowid, id, payload FROM records
+             WHERE rowid < ?1
+               AND (?3 = '' OR EXISTS (
+                 SELECT 1 FROM json_each(payload)
+                 WHERE (?4 = '' OR json_each.key = ?4)
+                   AND instr(lower(CAST(json_each.value AS TEXT)), lower(?3)) > 0
+               ))
+             ORDER BY rowid DESC LIMIT ?2")
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt.query_map(params![before, limit], |row| {
+        let rows = stmt.query_map(params![before, limit, query, field], |row| {
             let cursor: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             let payload: String = row.get(2)?;
