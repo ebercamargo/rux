@@ -20,7 +20,7 @@ pub fn refresh_typed_ui(name: &str, typed: &[(String, String)]) -> Result<(), St
     }
     let directory = Path::new(name);
     if !directory.is_dir() { return Err(format!("CRUD directory does not exist: {name}")); }
-    let fields_js = typed.iter().map(|(field, _)| format!("\\\"{field}\\\"")).collect::<Vec<_>>().join(",");
+    let fields_js = typed.iter().map(|(field, _)| format!("\"{field}\"")).collect::<Vec<_>>().join(",");
     let html = TEMPLATE.replace("__RUX_TITLE__", name).replace("__RUX_FIELDS__", &fields_js);
     fs::write(directory.join("index.html"), html).map_err(|e| format!("cannot refresh UI: {e}"))?;
     Ok(())
