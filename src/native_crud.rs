@@ -277,6 +277,29 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn db_admission_rejects_when_saturated() {
+        let state = AppState {
+            db: r2d2::Pool::builder().max_size(1).build(SqliteConnectionManager::memory()).unwrap(),
+            fields: Arc::new(vec![]),
+            html: Arc::new(String::new()),
+            manifest: Arc::new(String::new()),
+            accepting: Arc::new(AtomicBool::new(true)),
+            api_slots: Arc::new(Semaphore::new(1)),
+            waiting_slots: Arc::new(Semaphore::new(1)),
+            api_wait: Duration::from_millis(1),
+            db_slots: Arc::new(Semaphore::new(1)),
+            db_wait: Duration::from_millis(1),
+            requests_total: Arc::new(AtomicU64::new(0)),
+            rejected_total: Arc::new(AtomicU64::new(0)),
+            request_duration_micros: Arc::new(AtomicU64::new(0)),
+        };
+        let permit = acquire_db(&state).await.unwrap();
+        assert!(matches!(acquire_db(&state).await, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        drop(permit);
+        assert!(acquire_db(&state).await.is_ok());
+    }
+
     #[test]
     fn validates_typed_payloads() {
         let fields = vec![("email".into(), "Email".into()), ("age".into(), "Int".into())];
