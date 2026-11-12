@@ -336,6 +336,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if api_token.as_ref().is_some_and(|token| token.len() < 32) {
         return Err("RUX_API_TOKEN must contain at least 32 characters".into());
     }
+    let environment = std::env::var("RUX_ENV").unwrap_or_else(|_| "development".into());
+    validate_runtime_environment(&environment, api_token.as_deref())?;
     let read_token = std::env::var("RUX_API_READ_TOKEN").ok().filter(|value| !value.is_empty());
     if read_token.as_ref().is_some_and(|token| token.len() < 32) {
         return Err("RUX_API_READ_TOKEN must contain at least 32 characters".into());
@@ -386,6 +388,20 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .await.map_err(|e| e.to_string())
 }
 
+fn validate_runtime_environment(environment: &str, api_token: Option<&str>) -> Result<(), String> {
+    match environment {
+        "development" | "test" => Ok(()),
+        "production" => {
+            if api_token.is_none_or(|token| token.len() < 32) {
+                Err("Production mode requires RUX_API_TOKEN with at least 32 characters. Configure HTTPS at the ingress or reverse proxy and implement user authentication before serving sensitive data.".into())
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("RUX_ENV must be development, test, or production".into()),
+    }
+}
+
 fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>) -> Result<(), String> {
     if ip.is_loopback() || explicit_opt_in == Some("true") {
         return Ok(());
@@ -396,6 +412,16 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn production_requires_api_credentials() {
+        let strong = "a".repeat(32);
+        assert!(validate_runtime_environment("development", None).is_ok());
+        assert!(validate_runtime_environment("test", None).is_ok());
+        assert!(validate_runtime_environment("production", None).is_err());
+        assert!(validate_runtime_environment("production", Some("short")).is_err());
+        assert!(validate_runtime_environment("production", Some(&strong)).is_ok());
+        assert!(validate_runtime_environment("prod", Some(&strong)).is_err());
+    }
     #[test]
     fn accepts_flexible_date_time_formats() {
         assert!(valid_datetime("83-21-06", "yy-dd-mm"));
