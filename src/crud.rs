@@ -92,7 +92,7 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 "use strict";
 const fields=[__RUX_FIELDS__];
 const fieldTypes={__RUX_TYPES__};
-function isoDate(value){const match=/^(\\d{2})\\/(\\d{2})\\/(\\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
+function isoDate(value){const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
 const key="rux:crud:__RUX_TITLE__:v1";
 const form=document.getElementById("record-form");
 const body=document.getElementById("table-body");
