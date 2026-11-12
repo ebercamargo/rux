@@ -21,6 +21,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             ',' => tokens.push(Token::Comma),
             '=' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::EqualEqual } else { Token::Equal }),
             '!' if chars.peek() == Some(&'=') => { chars.next(); tokens.push(Token::BangEqual); }
+            '!' => return Err("unexpected '!': use '!=' for inequality".into()),
             '<' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::LessEqual } else { Token::Less }),
             '>' => tokens.push(if chars.peek() == Some(&'=') { chars.next(); Token::GreaterEqual } else { Token::Greater }),
             '+' => tokens.push(Token::Plus),
@@ -59,10 +60,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
                 }
                 tokens.push(Token::Number(s));
             }
-            c if c.is_ascii_alphabetic() || c == '_' => {
+            c if c.is_alphabetic() || c == '_' => {
                 let mut s = c.to_string();
                 while let Some(c) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || *c == '_' { s.push(*c); chars.next(); } else { break; }
+                    if c.is_alphanumeric() || *c == '_' { s.push(*c); chars.next(); } else { break; }
                 }
                 tokens.push(match s.as_str() {
                     "app" => Token::App, "fn" => Token::Fn,
@@ -93,6 +94,16 @@ mod tests {
     fn accepts_utf8_bom() {
         let tokens = lex("\u{feff}app Hello { fn main() { print(\"Hi\") } }").unwrap();
         assert_eq!(tokens[0], Token::App);
+    }
+    #[test]
+    fn accepts_unicode_identifiers() {
+        let tokens = lex("app Gestão { fn main() { let descrição = \"ação\" } }").unwrap();
+        assert!(tokens.contains(&Token::Ident("Gestão".into())));
+        assert!(tokens.contains(&Token::Ident("descrição".into())));
+    }
+    #[test]
+    fn rejects_standalone_bang() {
+        assert!(lex("app Demo { fn main() { ! } }").is_err());
     }
     #[test]
     fn rejects_unclosed_string() {

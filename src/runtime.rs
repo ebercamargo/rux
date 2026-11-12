@@ -145,6 +145,14 @@ mod tests {
         run(&parser::parse(&lexer::lex(source)?)?)
     }
     #[test]
+    fn negative_arithmetic_runs() {
+        assert_eq!(execute_source("app A { fn main() { print(-5 + 2) } }").unwrap(), "-3\n");
+    }
+    #[test]
+    fn unicode_variables_run() {
+        assert_eq!(execute_source("app Gestão { fn main() { let descrição = \"Olá\"; print(descrição) } }").unwrap(), "Olá\n");
+    }
+    #[test]
     fn hello_world_runs() {
         assert_eq!(execute_source("app Hello { fn main() { let message = \"Hello, World!\"; print(message) } }").unwrap(), "Hello, World!\n");
     }
