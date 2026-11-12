@@ -100,13 +100,29 @@ fn dev(path: &str) -> Result<(), String> {
         }
         Ok(child)
     }
-    fn valid(exe: &Path, path: &str) -> bool {
-        Command::new(exe).args(["check", path]).output()
-            .is_ok_and(|output| output.status.success())
+    fn validate_source(exe: &Path, path: &str) -> Result<(), String> {
+        let output = Command::new(exe).args(["check", path]).output()
+            .map_err(|error| format!("Cannot validate source: {error}"))?;
+        if output.status.success() { return Ok(()); }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let details = stderr.trim();
+        let details = if details.is_empty() { stdout.trim() } else { details };
+        if details.is_empty() {
+            Err(format!("Source validation failed (exit status: {})", output.status))
+        } else {
+            Err(details.to_string())
+        }
+    }
+    fn show_validation_error(console: &mut dev_console::DevConsole, error: &str) {
+        for line in error.lines() {
+            console.log("ERROR", line);
+        }
+        console.log("WARN", "Previous application retained; fix the source and save to retry.");
     }
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let mut source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    if !valid(&exe, path) { return Err("Fix source errors before starting dev mode".into()); }
+    validate_source(&exe, path)?;
     let (tx, rx) = mpsc::channel::<String>();
     let mut child = launch(&exe, path, &tx)?;
     let absolute_source = Path::new(path).canonicalize().unwrap_or_else(|_| Path::new(path).to_path_buf());
@@ -125,14 +141,14 @@ fn dev(path: &str) -> Result<(), String> {
                     match key.code {
                         KeyCode::Char('q' | 'Q') => quit = true,
                         KeyCode::Char('r' | 'R') => {
-                            if valid(&exe, path) {
+                            if let Ok(()) = validate_source(&exe, path) {
                                 let _ = child.kill(); let _ = child.wait();
                                 child = launch(&exe, path, &tx)?;
                                 console.clear_endpoint();
                                 console.status = "RUNNING".into();
                                 console.log("SUCCESS", "Application restarted");
                                 exit_reported = false;
-                            } else { console.log("ERROR", "Validation failed; keeping current application"); }
+                            } else if let Err(error) = validate_source(&exe, path) { show_validation_error(&mut console, &error); }
                         }
                         KeyCode::Char('t' | 'T') => {
                             console.log("INFO", "Running tests...");
@@ -174,7 +190,7 @@ fn dev(path: &str) -> Result<(), String> {
                     console.status = "RUNNING".into();
                     console.log("SUCCESS", "Source changed; application restarted");
                     exit_reported = false;
-                } else { console.log("ERROR", "Source validation failed; previous application retained"); }
+                } else if let Err(error) = validate_source(&exe, path) { show_validation_error(&mut console, &error); }
             }
             _ => {}
         }
