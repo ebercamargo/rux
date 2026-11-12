@@ -269,14 +269,15 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
     };
     if request.uri().path().starts_with("/api/") {
         let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
+            .and_then(|value| value.to_str().ok()).map(str::to_owned);
+        let operation = request.method().as_str().to_owned();
         match state.auth_mode {
             AuthMode::Legacy => {
-                if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
+                if !authorize_api(request.method(), authorization.as_deref(), state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
             }
-            AuthMode::Identities => check_identity(&state, authorization, request.method().as_str()).await?,
+            AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
         }
     }
     let start = Instant::now();
