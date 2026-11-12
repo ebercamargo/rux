@@ -55,17 +55,17 @@ impl DevConsole {
         let _ = queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All));
         let heading = format!(" RUX {}  |  DEVELOPMENT  |  {}", env!("CARGO_PKG_VERSION"), self.status);
         let _ = queue!(out, SetForegroundColor(Color::Cyan), Print(truncate(&heading, width)), ResetColor);
-        let _ = queue!(out, cursor::MoveTo(0, 1), Print(truncate(&format!(" Source: {}", self.source), width)));
-        let rule = "-".repeat(width as usize);
         let endpoint = self.server_url.as_deref().unwrap_or("Waiting for server...");
         let port = self.server_url.as_deref().and_then(|url| url.split("://").nth(1))
             .and_then(|authority| authority.split('/').next())
             .and_then(|authority| authority.rsplit_once(':'))
             .map(|(_, port)| port).unwrap_or("--");
-        let _ = queue!(out, cursor::MoveTo(0, 2), SetForegroundColor(Color::Green),
-            Print(truncate(&format!(" URL: {endpoint}  |  Port: {port}"), width)), ResetColor);
-        let _ = queue!(out, cursor::MoveTo(0, 3), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
-        let available = (height - 6) as usize;
+        let details = format!(" Source: {}  -- URL: {endpoint}  |  Port: {port}", self.source);
+        let _ = queue!(out, cursor::MoveTo(0, 1), SetForegroundColor(Color::Green),
+            Print(truncate(&details, width)), ResetColor);
+        let rule = "-".repeat(width as usize);
+        let _ = queue!(out, cursor::MoveTo(0, 2), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
+        let available = (height - 5) as usize;
         let end = self.lines.len().saturating_sub(self.scroll.min(self.lines.len()));
         let start = end.saturating_sub(available);
         for (index, line) in self.lines.iter().skip(start).take(available).enumerate() {
@@ -75,7 +75,7 @@ impl DevConsole {
                 else if line.starts_with("[SUCCESS]") { Color::Green }
                 else if line.starts_with("[INFO]") { Color::Blue }
                 else { Color::White };
-            let _ = queue!(out, cursor::MoveTo(0, index as u16 + 4), SetForegroundColor(color), Print(truncate(line, width)), ResetColor);
+            let _ = queue!(out, cursor::MoveTo(0, index as u16 + 3), SetForegroundColor(color), Print(truncate(line, width)), ResetColor);
         }
         let _ = queue!(out, cursor::MoveTo(0, height - 2), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
         let actions = "[R] Restart  [T] Tests  [S] Status  [H] Help  [Q] Quit  [Up/Down] Scroll";
