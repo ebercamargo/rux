@@ -63,7 +63,17 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
             let (field, ty) = line.split_once(':').ok_or_else(|| format!("line {}: expected field: Type", index + 1))?;
             let field = field.trim();
             let ty = ty.trim();
-            let ty = if let Some(pattern) = ty.strip_prefix("DateTime,") {
+            let ty = if let Some(pattern) = ty.strip_prefix("Text,") {
+                let pattern = pattern.trim();
+                if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
+                    return Err(format!("line {}: Text mask requires a quoted pattern", index + 1));
+                }
+                let pattern = &pattern[1..pattern.len() - 1];
+                if pattern.len() > 64 || !pattern.contains('9') || !pattern.chars().all(|ch| ch == '9' || " .-/()+".contains(ch)) {
+                    return Err(format!("line {}: invalid Text mask (use 9 for digits)", index + 1));
+                }
+                format!("Text|{pattern}")
+            } else if let Some(pattern) = ty.strip_prefix("DateTime,") {
                 let pattern = pattern.trim();
                 if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
                     return Err(format!("line {}: DateTime requires a quoted format", index + 1));
@@ -76,7 +86,7 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
                 }
                 format!("DateTime|{pattern}")
             } else { ty.to_string() };
-            if !matches!(ty.as_str(), "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") && !ty.starts_with("DateTime|") {
+            if !matches!(ty.as_str(), "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") && !ty.starts_with("DateTime|") && !ty.starts_with("Text|") {
                 return Err(format!("line {}: unsupported field type: {ty}", index + 1));
             }
             fields.push((field.to_string(), ty));
