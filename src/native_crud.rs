@@ -225,6 +225,7 @@ fn authorize_api(method: &axum::http::Method, authorization: Option<&str>, write
 }
 
 async fn check_identity(state: &AppState, authorization: Option<&str>, operation: &str) -> Result<(), StatusCode> {
+    let _db_permit = acquire_db(state).await?;
     let pool = state.db.clone();
     let bearer = authorization.map(str::to_owned);
     let operation = operation.to_owned();
@@ -242,18 +243,6 @@ async fn check_identity(state: &AppState, authorization: Option<&str>, operation
 
 async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
-    if request.uri().path().starts_with("/api/") {
-        let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok());
-        match state.auth_mode {
-            AuthMode::Legacy => {
-                if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
-                    return Err(StatusCode::UNAUTHORIZED);
-                }
-            }
-            AuthMode::Identities => check_identity(&state, authorization, request.method().as_str()).await?,
-        }
-    }
     if !state.accepting.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -278,6 +267,18 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
             },
         }
     };
+    if request.uri().path().starts_with("/api/") {
+        let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        match state.auth_mode {
+            AuthMode::Legacy => {
+                if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            AuthMode::Identities => check_identity(&state, authorization, request.method().as_str()).await?,
+        }
+    }
     let start = Instant::now();
     let response = next.run(request).await;
     state.request_duration_micros.fetch_add(start.elapsed().as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
