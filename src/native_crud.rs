@@ -1,5 +1,5 @@
-use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}};
-use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::get, Json, Router};
+use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
+use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit, ConnectInfo}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
@@ -15,6 +15,8 @@ struct AppState {
     manifest: Arc<String>,
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
+    rate_windows: Arc<Mutex<HashMap<IpAddr, ClientWindow>>>,
+    rate_limit_per_minute: u32,
     accepting: Arc<AtomicBool>,
     api_slots: Arc<Semaphore>,
     waiting_slots: Arc<Semaphore>,
@@ -24,6 +26,45 @@ struct AppState {
     requests_total: Arc<AtomicU64>,
     rejected_total: Arc<AtomicU64>,
     request_duration_micros: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy)]
+struct ClientWindow {
+    started: Instant,
+    used: u32,
+}
+
+fn within_rate_limit(windows: &Mutex<HashMap<IpAddr, ClientWindow>>, ip: IpAddr, limit: u32, now: Instant) -> bool {
+    let Ok(mut windows) = windows.lock() else { return false; };
+    let interval = Duration::from_secs(60);
+    if let Some(client) = windows.get_mut(&ip) {
+        if now.duration_since(client.started) >= interval {
+            client.started = now;
+            client.used = 1;
+            return true;
+        }
+        if client.used >= limit { return false; }
+        client.used += 1;
+        return true;
+    }
+    if windows.len() >= 10_000 {
+        windows.retain(|_, client| now.duration_since(client.started) < interval);
+        if windows.len() >= 10_000 { return false; }
+    }
+    windows.insert(ip, ClientWindow { started: now, used: 1 });
+    true
+}
+
+async fn rate_gate(State(state): State<AppState>, request: Request, next: Next) -> Result<axum::response::Response, StatusCode> {
+    let ip = request.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip())
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    if !within_rate_limit(&state.rate_windows, ip, state.rate_limit_per_minute, Instant::now()) {
+        state.rejected_total.fetch_add(1, Ordering::Relaxed);
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(request).await)
 }
 
 fn valid_mask(value: &str, pattern: &str) -> bool {
@@ -318,6 +359,12 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     db.get().map_err(|e| e.to_string())?
         .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
         .map_err(|e| e.to_string())?;
+    let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
+        .unwrap_or_else(|_| "120".into())
+        .parse().map_err(|_| "RUX_RATE_LIMIT_PER_MINUTE must be an integer".to_string())?;
+    if !(1..=100_000).contains(&rate_limit_per_minute) {
+        return Err("RUX_RATE_LIMIT_PER_MINUTE must be between 1 and 100000".into());
+    }
     let max_requests: usize = std::env::var("RUX_MAX_CONCURRENT_REQUESTS")
         .unwrap_or_else(|_| "256".into())
         .parse().map_err(|_| "RUX_MAX_CONCURRENT_REQUESTS must be an integer".to_string())?;
@@ -371,7 +418,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         return Err("RUX_API_READ_TOKEN must differ from RUX_API_TOKEN".into());
     }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state_for_rate = state.clone();
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -388,10 +436,11 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         router
     };
     let router = router.layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(middleware::from_fn_with_state(state_for_rate, rate_gate))
         .layer(middleware::from_fn(security_headers));
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
             {
@@ -436,6 +485,18 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rate_limit_is_per_client_and_resets_after_one_minute() {
+        let windows = Mutex::new(HashMap::new());
+        let first: IpAddr = "127.0.0.1".parse().unwrap();
+        let second: IpAddr = "127.0.0.2".parse().unwrap();
+        let now = Instant::now();
+        assert!(within_rate_limit(&windows, first, 2, now));
+        assert!(within_rate_limit(&windows, first, 2, now));
+        assert!(!within_rate_limit(&windows, first, 2, now));
+        assert!(within_rate_limit(&windows, second, 2, now));
+        assert!(within_rate_limit(&windows, first, 2, now + Duration::from_secs(60)));
+    }
     #[test]
     fn production_requires_api_credentials() {
         let strong = "a".repeat(32);
@@ -497,6 +558,8 @@ mod tests {
             manifest: Arc::new(String::new()),
             api_token: None,
             read_token: None,
+            rate_windows: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit_per_minute: 120,
             accepting: Arc::new(AtomicBool::new(true)),
             api_slots: Arc::new(Semaphore::new(1)),
             waiting_slots: Arc::new(Semaphore::new(1)),
