@@ -24,6 +24,32 @@ struct AppState {
     request_duration_micros: Arc<AtomicU64>,
 }
 
+fn valid_datetime(value: &str, pattern: &str) -> bool {
+    use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+    let chrono_pattern = match pattern {
+        "dd/MM/yyyy" => "%d/%m/%Y",
+        "yyyy-MM-dd" => "%Y-%m-%d",
+        "MM/dd/yyyy" => "%m/%d/%Y",
+        "dd.MM.yyyy" => "%d.%m.%Y",
+        "dd/MM/yyyy HH:mm:ss" => "%d/%m/%Y %H:%M:%S",
+        "dd/MM/yyyy HH:mm:ss.SSS" => "%d/%m/%Y %H:%M:%S%.3f",
+        "HH:mm:ss" => "%H:%M:%S",
+        "MM/yyyy" => {
+            let parts: Vec<_> = value.split('/').collect();
+            return parts.len() == 2 && parts[0].len() == 2 && parts[1].len() == 4
+                && parts[0].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
+                && parts[1].parse::<i32>().is_ok_and(|year| (1..=9999).contains(&year));
+        }
+        _ => return false,
+    };
+    match pattern {
+        "HH:mm:ss" => NaiveTime::parse_from_str(value, chrono_pattern).is_ok(),
+        "dd/MM/yyyy HH:mm:ss" | "dd/MM/yyyy HH:mm:ss.SSS" =>
+            NaiveDateTime::parse_from_str(value, chrono_pattern).is_ok(),
+        _ => NaiveDate::parse_from_str(value, chrono_pattern).is_ok(),
+    }
+}
+
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
     let object = input.as_object().ok_or(StatusCode::BAD_REQUEST)?;
     let mut result = Map::new();
@@ -31,7 +57,9 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
         let value = object.get(name).and_then(Value::as_str).ok_or(StatusCode::BAD_REQUEST)?;
         let value = value.trim();
         if value.is_empty() || value.len() > 250 { return Err(StatusCode::BAD_REQUEST); }
-        let valid = match kind.as_str() {
+        let valid = if let Some(pattern) = kind.strip_prefix("DateTime|") {
+            valid_datetime(value, pattern)
+        } else { match kind.as_str() {
             "Email" => {
                 let parts: Vec<_> = value.split('@').collect();
                 parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') && !value.contains(char::is_whitespace)
@@ -42,7 +70,7 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
             "Date" => value.len() == 10 && value.as_bytes().get(4) == Some(&b'-') && value.as_bytes().get(7) == Some(&b'-')
                 && value.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
             _ => true,
-        };
+        }};
         if !valid { return Err(StatusCode::BAD_REQUEST); }
         result.insert(name.clone(), Value::String(value.to_string()));
     }
