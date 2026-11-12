@@ -13,6 +13,7 @@ struct AppState {
     fields: Arc<Vec<(String, String)>>,
     html: Arc<String>,
     manifest: Arc<String>,
+    api_token: Option<Arc<String>>,
     accepting: Arc<AtomicBool>,
     api_slots: Arc<Semaphore>,
     waiting_slots: Arc<Semaphore>,
@@ -96,8 +97,26 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
     Ok(result)
 }
 
+fn token_matches(provided: &str, expected: &str) -> bool {
+    let Some(value) = provided.strip_prefix("Bearer ") else { return false; };
+    let a = value.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (&left, &right) in a.iter().zip(b) { diff |= left ^ right; }
+    diff == 0
+}
+
 async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
+    if request.uri().path().starts_with("/api/") {
+        if let Some(expected) = state.api_token.as_deref() {
+            let authorized = request.headers().get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| token_matches(value, expected));
+            if !authorized { return Err(StatusCode::UNAUTHORIZED); }
+        }
+    }
     if !state.accepting.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -303,8 +322,21 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if db_wait_ms > 60_000 {
         return Err("RUX_DB_WAIT_MS must be between 0 and 60000".into());
     }
+    let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
+        .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
+    let address: SocketAddr = format!("{host}:{port}").parse()
+        .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
+    validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
+    let api_token = std::env::var("RUX_API_TOKEN").ok().filter(|value| !value.is_empty());
+    if !address.ip().is_loopback() && api_token.as_ref().is_none_or(|token| token.len() < 32) {
+        return Err("Remote CRUD requires RUX_API_TOKEN with at least 32 characters. Use TLS at a trusted reverse proxy; this is not a full user authentication system.".into());
+    }
+    if api_token.as_ref().is_some_and(|token| token.len() < 32) {
+        return Err("RUX_API_TOKEN must contain at least 32 characters".into());
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -320,12 +352,6 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     } else {
         router
     };
-    let host = std::env::var("RUX_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string())
-        .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
-    let address: SocketAddr = format!("{host}:{port}").parse()
-        .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
-    validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
     axum::serve(listener, router)
@@ -360,6 +386,14 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 mod tests {
     use super::*;
     #[test]
+    fn bearer_token_requires_exact_match() {
+        let token = "a".repeat(32);
+        assert!(token_matches(&format!("Bearer {token}"), &token));
+        assert!(!token_matches(&format!("Bearer {}b", &token[..31]), &token));
+        assert!(!token_matches(&token, &token));
+        assert!(!token_matches("Bearer wrong", &token));
+    }
+    #[test]
     fn remote_crud_requires_explicit_opt_in() {
         assert!(validate_network_exposure("127.0.0.1".parse().unwrap(), None).is_ok());
         assert!(validate_network_exposure("::1".parse().unwrap(), None).is_ok());
@@ -374,6 +408,7 @@ mod tests {
             fields: Arc::new(vec![]),
             html: Arc::new(String::new()),
             manifest: Arc::new(String::new()),
+            api_token: None,
             accepting: Arc::new(AtomicBool::new(true)),
             api_slots: Arc::new(Semaphore::new(1)),
             waiting_slots: Arc::new(Semaphore::new(1)),
