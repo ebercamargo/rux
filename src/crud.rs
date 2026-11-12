@@ -102,6 +102,39 @@ function applyDigitMask(value,pattern){
  }
  return result;
 }
+function datePatternParts(pattern){
+ const tokens=pattern.match(/yyyy|yy|MMMM|MMM|MM|dd|HH|hh|mm|ss|M|d|H|h|m|s|S{1,9}|a/g)||[];
+ const numeric=tokens.every(t=>/^(yyyy|yy|MM|dd|HH|hh|mm|ss|M|d|H|h|m|s|S{1,9})$/.test(t));
+ return {tokens,numeric};
+}
+function applyDateMask(value,pattern){
+ const parts=datePatternParts(pattern);
+ if(!parts.numeric)return value;
+ const digits=String(value).replace(/\D/g,"");
+ let index=0,result="",cursor=0;
+ const re=/yyyy|yy|MM|dd|HH|hh|mm|ss|M|d|H|h|m|s|S{1,9}/g;
+ for(const match of pattern.matchAll(re)){
+  if(cursor<match.index&&index<digits.length)result+=pattern.slice(cursor,match.index);
+  const token=match[0],size=token==="yyyy"?4:token.length===1?2:token.length;
+  const part=digits.slice(index,index+size);
+  if(!part)break;
+  result+=part;index+=part.length;cursor=match.index+token.length;
+ }
+ return result;
+}
+function validateDatePattern(value,pattern){
+ const parts=datePatternParts(pattern);
+ if(!parts.numeric)return true;
+ const re=/yyyy|yy|MM|dd|HH|hh|mm|ss|M|d|H|h|m|s|S{1,9}/g;
+ let expression="^",cursor=0;
+ for(const match of pattern.matchAll(re)){
+  expression+=pattern.slice(cursor,match.index).replace(/[.*+?^${}()|[\]\\]/g,"\\function isoDate(value)");
+  const token=match[0],size=token==="yyyy"?4:token.length===1?2:token.length;
+  expression+="(\\d{"+size+"})";cursor=match.index+token.length;
+ }
+ expression+=pattern.slice(cursor).replace(/[.*+?^${}()|[\]\\]/g,"\\function isoDate(value)")+"$";
+ return new RegExp(expression).test(value);
+}
 function isoDate(value){const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
 const key="rux:crud:__RUX_TITLE__:v1";
 const form=document.getElementById("record-form");
@@ -151,7 +184,18 @@ for(const field of fields){
  const declaredType=regexSeparator>=0?fieldTypes[field].slice(0,regexSeparator):fieldTypes[field];
  if(validationRegex){input.pattern=validationRegex;input.title="Formato inválido";}
  if(declaredType==="Date"||declaredType==="DateTime|yyyy-MM-dd")input.type="date";
- else if(declaredType&&declaredType.startsWith("DateTime|")){input.type="text";input.placeholder=declaredType.slice(9);input.title="Formato: "+input.placeholder;}
+ else if(declaredType&&declaredType.startsWith("DateTime|")){
+  const pattern=declaredType.slice(9);
+  input.type="text";input.placeholder=pattern;input.title="Formato: "+pattern;
+  if(datePatternParts(pattern).numeric){
+   input.inputMode="numeric";
+   input.maxLength=pattern.length;
+   input.addEventListener("input",()=>{input.value=applyDateMask(input.value,pattern);input.setCustomValidity("");});
+  }
+  input.addEventListener("blur",()=>{
+   input.setCustomValidity(input.value&&!validateDatePattern(input.value,pattern)?"Data/hora inválida. Use o formato "+pattern:"");
+  });
+ }
  else if(declaredType&&declaredType.startsWith("Text|")){
   const mask=declaredType.slice(5);
   input.type="text";input.placeholder=mask;input.maxLength=mask.length;
@@ -171,6 +215,10 @@ function reset(){editing=null;form.reset();cancel.hidden=true;document.getElemen
 cancel.addEventListener("click",reset);
 form.addEventListener("submit",async event=>{
  event.preventDefault();
+ for(const field of fields){
+  const input=form.elements.namedItem(field),type=fieldTypes[field]||"";
+  if(type.startsWith("DateTime|")){const pattern=type.slice(9);input.setCustomValidity(validateDatePattern(input.value,pattern)?"":"Data/hora inválida. Use o formato "+pattern);}
+ }
  if(!form.reportValidity())return;
  const values=Object.fromEntries(fields.map(f=>[f,form.elements.namedItem(f).value.trim()]));
  if(fields.some(f=>!values[f])){status.textContent="Preencha todos os campos.";return;}
