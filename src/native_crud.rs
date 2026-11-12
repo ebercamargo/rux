@@ -307,7 +307,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let address: SocketAddr = format!("{host}:{port}").parse()
         .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
-    println!("RUX native CRUD: http://{address} (SQLite, no Node.js)");
+    println!("RUX native CRUD: http://{address} (SQLite)");
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
