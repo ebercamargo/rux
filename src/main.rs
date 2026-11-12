@@ -229,11 +229,14 @@ fn project_check(path: &str) {
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity");
     println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
     println!("  secret generate  Generate a random API secret (keep it private)");
+    println!("  identity create <project> <name> <reader|editor|admin>  Create API identity");
+    println!("  identity list <project>                         List identities (no secrets)");
+    println!("  identity revoke <project> <name>                Revoke API identity");
     println!("  --version        Print version");
     println!("  --help           Show this help");
 }
@@ -243,6 +246,32 @@ fn main() {
     match args.as_slice() {
         [_, operation, subcommand] if operation == "secret" && subcommand == "generate" => {
             println!("{}", generate_api_secret());
+        }
+        [_, operation, subcommand, project, name, role] if operation == "identity" && subcommand == "create" => {
+            match rux::identity::create_in_project(Path::new(project), name, role) {
+                Ok(token) => {
+                    println!("Identity created: {name} ({role})");
+                    println!("API token (displayed once; store securely): {token}");
+                }
+                Err(error) => { eprintln!("RUX identity error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, name] if operation == "identity" && subcommand == "revoke" => {
+            match rux::identity::revoke_in_project(Path::new(project), name) {
+                Ok(true) => println!("Identity revoked: {name}"),
+                Ok(false) => { eprintln!("RUX identity error: identity not found or already revoked"); process::exit(1); }
+                Err(error) => { eprintln!("RUX identity error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project] if operation == "identity" && subcommand == "list" => {
+            match rux::identity::list_in_project(Path::new(project)) {
+                Ok(identities) => {
+                    for (name, role, revoked) in identities {
+                        println!("{name} | {role} | {}", if revoked { "REVOKED" } else { "ACTIVE" });
+                    }
+                }
+                Err(error) => { eprintln!("RUX identity error: {error}"); process::exit(1); }
+            }
         }
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
         [_, flag] if flag == "--version" || flag == "-V" => {
