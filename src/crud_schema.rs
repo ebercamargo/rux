@@ -64,10 +64,22 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
             let field = field.trim();
             let ty = ty.trim();
             let (ty, regex_pattern) = if let Some((base, expression)) = ty.split_once(", regex(") {
-                let expression = expression.strip_suffix(')').ok_or_else(|| format!("line {}: invalid regex declaration", index + 1))?;
+                let expression = expression.strip_suffix(')')
+                    .ok_or_else(|| format!("line {}: invalid regex declaration", index + 1))?;
                 let pattern = expression.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
                     .ok_or_else(|| format!("line {}: regex must be quoted", index + 1))?;
-                if pattern.is_empty() || pattern.len() > 200 || !pattern.starts_with('^') || !pattern.ends_with('
+                if pattern.is_empty() || pattern.len() > 200
+                    || !pattern.starts_with('^') || !pattern.ends_with('$')
+                    || pattern.contains('"') || pattern.contains(char::from(92))
+                {
+                    return Err(format!("line {}: regex must be anchored, at most 200 characters, without backslashes or quotes", index + 1));
+                }
+                regex::Regex::new(pattern)
+                    .map_err(|error| format!("line {}: invalid regex: {error}", index + 1))?;
+                (base.trim(), Some(pattern))
+            } else {
+                (ty, None)
+            };
             let ty = if let Some(pattern) = ty.strip_prefix("Text,") {
                 let pattern = pattern.trim();
                 if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
