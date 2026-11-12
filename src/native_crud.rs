@@ -15,6 +15,7 @@ struct AppState {
     manifest: Arc<String>,
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
+    allowed_hosts: Arc<Vec<String>>,
     rate_windows: Arc<Mutex<HashMap<IpAddr, ClientWindow>>>,
     rate_limit_per_minute: u32,
     accepting: Arc<AtomicBool>,
@@ -63,6 +64,64 @@ async fn rate_gate(State(state): State<AppState>, request: Request, next: Next) 
     if !within_rate_limit(&state.rate_windows, ip, state.rate_limit_per_minute, Instant::now()) {
         state.rejected_total.fetch_add(1, Ordering::Relaxed);
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(next.run(request).await)
+}
+
+fn normalized_host(value: &str) -> Option<String> {
+    if value.contains('@') { return None; }
+    let authority: axum::http::uri::Authority = value.parse().ok()?;
+    let host = authority.host().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+fn allowed_host_names(ip: IpAddr, configured: Option<&str>) -> Result<Vec<String>, String> {
+    let raw = match configured {
+        Some(value) => value,
+        None if ip.is_loopback() => return Ok(vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]),
+        None => return Err("Remote bind requires RUX_ALLOWED_HOSTS (comma-separated hostnames or IPs; wildcards are not supported)".into()),
+    };
+    if raw.len() > 4096 { return Err("RUX_ALLOWED_HOSTS is too long".into()); }
+    let mut result = Vec::new();
+    for item in raw.split(',') {
+        let name = item.trim();
+        if name.is_empty() || name == "*" || name.contains('/') || name.contains(' ') {
+            return Err("RUX_ALLOWED_HOSTS contains an invalid host".into());
+        }
+        let authority: axum::http::uri::Authority = name.parse()
+            .map_err(|_| format!("Invalid RUX_ALLOWED_HOSTS entry: {name}"))?;
+        if authority.port_u16().is_some() || name.contains('@') {
+            return Err("RUX_ALLOWED_HOSTS entries must not include ports or userinfo".into());
+        }
+        let normalized = normalized_host(name)
+            .ok_or_else(|| format!("Invalid RUX_ALLOWED_HOSTS entry: {name}"))?;
+        if !result.contains(&normalized) { result.push(normalized); }
+        if result.len() > 32 { return Err("RUX_ALLOWED_HOSTS supports at most 32 distinct hosts".into()); }
+    }
+    Ok(result)
+}
+
+async fn host_origin_guard(State(state): State<AppState>, request: Request, next: Next)
+    -> Result<axum::response::Response, StatusCode>
+{
+    use axum::http::header::{HOST, ORIGIN};
+    let host_header = request.headers().get(HOST)
+        .and_then(|header| header.to_str().ok())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let host = normalized_host(host_header).ok_or(StatusCode::BAD_REQUEST)?;
+    if !state.allowed_hosts.iter().any(|allowed| allowed == &host) {
+        return Err(StatusCode::MISDIRECTED_REQUEST);
+    }
+    if !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD) {
+        if let Some(origin) = request.headers().get(ORIGIN) {
+            let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
+            let uri: axum::http::Uri = origin.parse().map_err(|_| StatusCode::FORBIDDEN)?;
+            if !matches!(uri.scheme_str(), Some("http" | "https"))
+                || !uri.authority().is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host_header))
+            {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
     }
     Ok(next.run(request).await)
 }
@@ -395,6 +454,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let address: SocketAddr = format!("{host}:{port}").parse()
         .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
     validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
+    let allowed_hosts = allowed_host_names(address.ip(), std::env::var("RUX_ALLOWED_HOSTS").ok().as_deref())?;
     let api_token = std::env::var("RUX_API_TOKEN").ok().filter(|value| !value.is_empty());
     if !address.ip().is_loopback() && api_token.as_ref().is_none_or(|token| token.len() < 32) {
         return Err("Remote CRUD requires RUX_API_TOKEN with at least 32 characters. Use TLS at a trusted reverse proxy; this is not a full user authentication system.".into());
@@ -418,8 +478,9 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         return Err("RUX_API_READ_TOKEN must differ from RUX_API_TOKEN".into());
     }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
+    let state_for_host = state.clone();
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -437,6 +498,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     };
     let router = router.layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state_for_rate, rate_gate))
+        .layer(middleware::from_fn_with_state(state_for_host, host_origin_guard))
         .layer(middleware::from_fn(security_headers));
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
@@ -485,6 +547,18 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_servers_require_explicit_host_allowlist() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let public_ip: IpAddr = "0.0.0.0".parse().unwrap();
+        assert!(allowed_host_names(loopback, None).unwrap().contains(&"localhost".into()));
+        assert!(allowed_host_names(public_ip, None).is_err());
+        let names = allowed_host_names(public_ip, Some("api.example.com, 192.0.2.10")).unwrap();
+        assert_eq!(names, vec!["api.example.com", "192.0.2.10"]);
+        assert!(allowed_host_names(public_ip, Some("*,api.example.com")).is_err());
+        assert!(allowed_host_names(public_ip, Some("api.example.com:3000")).is_err());
+        assert_eq!(normalized_host("Example.Com:3000").as_deref(), Some("example.com"));
+    }
     #[test]
     fn rate_limit_is_per_client_and_resets_after_one_minute() {
         let windows = Mutex::new(HashMap::new());
@@ -558,6 +632,7 @@ mod tests {
             manifest: Arc::new(String::new()),
             api_token: None,
             read_token: None,
+            allowed_hosts: Arc::new(vec!["localhost".into()]),
             rate_windows: Arc::new(Mutex::new(HashMap::new())),
             rate_limit_per_minute: 120,
             accepting: Arc::new(AtomicBool::new(true)),
