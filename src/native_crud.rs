@@ -39,28 +39,21 @@ fn valid_mask(value: &str, pattern: &str) -> bool {
 
 fn valid_datetime(value: &str, pattern: &str) -> bool {
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-    let chrono_pattern = match pattern {
-        "dd/MM/yyyy" => "%d/%m/%Y",
-        "yyyy-MM-dd" => "%Y-%m-%d",
-        "MM/dd/yyyy" => "%m/%d/%Y",
-        "dd.MM.yyyy" => "%d.%m.%Y",
-        "dd/MM/yyyy HH:mm:ss" => "%d/%m/%Y %H:%M:%S",
-        "dd/MM/yyyy HH:mm:ss.SSS" => "%d/%m/%Y %H:%M:%S%.3f",
-        "HH:mm:ss" => "%H:%M:%S",
-        "MM/yyyy" => {
-            let parts: Vec<_> = value.split('/').collect();
-            return parts.len() == 2 && parts[0].len() == 2 && parts[1].len() == 4
-                && parts[0].parse::<u32>().is_ok_and(|month| (1..=12).contains(&month))
-                && parts[1].parse::<i32>().is_ok_and(|year| (1..=9999).contains(&year));
+    let Ok(format) = super::crud_schema::chrono_datetime_pattern(pattern) else { return false; };
+    let has_date = format.contains("%d") || format.contains("%m") || format.contains("%b") || format.contains("%B") || format.contains("%y") || format.contains("%Y");
+    let has_time = format.contains("%H") || format.contains("%I") || format.contains("%M") || format.contains("%S") || format.contains("%f") || format.contains("%p");
+    if has_date && has_time {
+        NaiveDateTime::parse_from_str(value, &format).is_ok()
+    } else if has_time {
+        NaiveTime::parse_from_str(value, &format).is_ok()
+    } else if has_date {
+        if NaiveDate::parse_from_str(value, &format).is_ok() { return true; }
+        // Partial month/year formats are validated by supplying a harmless default day.
+        if !format.contains("%d") && (format.contains("%m") || format.contains("%b") || format.contains("%B")) && (format.contains("%y") || format.contains("%Y")) {
+            return NaiveDate::parse_from_str(&format!("{value}-01"), &format!("{format}-%d")).is_ok();
         }
-        _ => return false,
-    };
-    match pattern {
-        "HH:mm:ss" => NaiveTime::parse_from_str(value, chrono_pattern).is_ok(),
-        "dd/MM/yyyy HH:mm:ss" | "dd/MM/yyyy HH:mm:ss.SSS" =>
-            NaiveDateTime::parse_from_str(value, chrono_pattern).is_ok(),
-        _ => NaiveDate::parse_from_str(value, chrono_pattern).is_ok(),
-    }
+        false
+    } else { false }
 }
 
 fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Value>, StatusCode> {
@@ -403,6 +396,16 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_flexible_date_time_formats() {
+        assert!(valid_datetime("83-21-06", "yy-dd-mm"));
+        assert!(valid_datetime("2026-11-12", "yyyy-MM-dd"));
+        assert!(valid_datetime("12/11/2026 13:45:20", "dd/MM/yyyy HH:mm:ss"));
+        assert!(valid_datetime("13:45:20", "HH:mm:ss"));
+        assert!(valid_datetime("11/2026", "MM/yyyy"));
+        assert!(!valid_datetime("2026-02-30", "yyyy-MM-dd"));
+        assert!(!valid_datetime("83-32-06", "yy-dd-mm"));
+    }
     #[test]
     fn api_tokens_enforce_read_only_access() {
         use axum::http::Method;
