@@ -1,6 +1,10 @@
 mod dev_console;
 use std::{env, fs, path::Path, process};
 
+fn generate_api_secret() -> String {
+    format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+}
+
 fn create_project(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().next().unwrap().is_ascii_alphabetic()
         || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
@@ -225,10 +229,11 @@ fn project_check(path: &str) {
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate");
     println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
+    println!("  secret generate  Generate a random API secret (keep it private)");
     println!("  --version        Print version");
     println!("  --help           Show this help");
 }
@@ -236,6 +241,9 @@ fn help() {
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.as_slice() {
+        [_, operation, subcommand] if operation == "secret" && subcommand == "generate" => {
+            println!("{}", generate_api_secret());
+        }
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rux {}", env!("CARGO_PKG_VERSION"));
@@ -286,6 +294,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_api_secret_uses_256_bit_uuid_material() {
+        let secret = generate_api_secret();
+        assert_eq!(secret.len(), 64);
+        assert!(secret.chars().all(|character| character.is_ascii_hexdigit()));
+    }
     #[test]
     fn rejects_invalid_project_names() {
         assert!(create_project("../bad").is_err());
