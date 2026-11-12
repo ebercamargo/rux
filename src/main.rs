@@ -107,10 +107,25 @@ fn dev(path: &str) -> Result<(), String> {
     }
 }
 
+fn project_check(path: &str) {
+    let layout = rux::project::discover(Path::new(path)).unwrap_or_else(|error| {
+        eprintln!("RUX project error: {error}");
+        process::exit(1);
+    });
+    println!("RUX project layout OK: {}", layout.root.display());
+    println!("Global config: {}", layout.app.display());
+    println!("Entry point: {}", layout.main.display());
+    println!("Modules found: {}", layout.modules.len());
+    for module in layout.modules {
+        println!("  {}", module.display());
+    }
+}
+
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, crud, crud-from");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from");
+    println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
     println!("  --version        Print version");
@@ -123,6 +138,12 @@ fn main() {
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
         [_, flag] if flag == "--version" || flag == "-V" => {
             println!("rux {}", env!("CARGO_PKG_VERSION"));
+        }
+        [_, command] if command == "project-check" => {
+            project_check(".");
+        }
+        [_, command, path] if command == "project-check" => {
+            project_check(path);
         }
         [_, command, path] if command == "crud-from" => {
             if let Err(error) = rux::crud_schema::generate(path) {
