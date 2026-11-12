@@ -109,7 +109,9 @@ fn dev(path: &str) -> Result<(), String> {
     if !valid(&exe, path) { return Err("Fix source errors before starting dev mode".into()); }
     let (tx, rx) = mpsc::channel::<String>();
     let mut child = launch(&exe, path, &tx)?;
-    let mut console = dev_console::DevConsole::new(path);
+    let absolute_source = Path::new(path).canonicalize().unwrap_or_else(|_| Path::new(path).to_path_buf());
+    let source_label = absolute_source.display().to_string();
+    let mut console = dev_console::DevConsole::new(&source_label);
     console.status = "RUNNING".into();
     console.log("INFO", "Application started. Watching for changes.");
     let mut exit_reported = false;
