@@ -68,43 +68,99 @@ fn execute_file(command: &str, path: &str) {
 }
 
 fn dev(path: &str) -> Result<(), String> {
-    use std::{process::Command, thread, time::Duration};
-    let executable = env::current_exe().map_err(|e| format!("cannot locate RUX executable: {e}"))?;
-    let mut last_source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let check = Command::new(&executable).args(["check", path]).status()
-        .map_err(|e| format!("cannot validate {path}: {e}"))?;
-    if !check.success() { return Err("Fix the RUX source errors before starting dev mode".into()); }
-    println!("RUX dev: watching {path} (Ctrl+C to stop)");
-    let mut child = Command::new(&executable).args(["run", path]).spawn()
-        .map_err(|e| format!("cannot start RUX application: {e}"))?;
-    loop {
-        thread::sleep(Duration::from_millis(400));
-        let source = match fs::read(path) {
-            Ok(source) => source,
-            Err(error) => {
-                eprintln!("RUX dev: cannot read {path}: {error}");
-                continue;
-            }
-        };
-        if source == last_source {
-            if let Ok(Some(status)) = child.try_wait() {
-                eprintln!("RUX dev: application exited ({status}); waiting for a file change");
-            }
-            continue;
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use std::{process::{Child, Command}, thread, time::Duration};
+
+    struct TerminalGuard(bool);
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {
+            if self.0 { let _ = disable_raw_mode(); }
         }
-        last_source = source;
-        thread::sleep(Duration::from_millis(200));
-        let check = Command::new(&executable).args(["check", path]).status();
-        if !matches!(check, Ok(status) if status.success()) {
+    }
+    fn spawn(executable: &Path, path: &str) -> Result<Child, String> {
+        Command::new(executable).args(["run", path]).spawn()
+            .map_err(|e| format!("cannot start RUX application: {e}"))
+    }
+    fn check(executable: &Path, path: &str) -> bool {
+        Command::new(executable).args(["check", path]).status()
+            .is_ok_and(|status| status.success())
+    }
+    fn restart(child: &mut Child, executable: &Path, path: &str) -> Result<(), String> {
+        if !check(executable, path) {
             eprintln!("RUX dev: validation failed; keeping previous application running");
-            continue;
+            return Ok(());
         }
-        println!("RUX dev: source changed; restarting application");
         let _ = child.kill();
         let _ = child.wait();
-        child = Command::new(&executable).args(["run", path]).spawn()
-            .map_err(|e| format!("cannot restart RUX application: {e}"))?;
+        *child = spawn(executable, path)?;
+        println!("RUX dev: application restarted");
+        Ok(())
     }
+
+    let executable = env::current_exe().map_err(|e| format!("cannot locate RUX executable: {e}"))?;
+    let mut last_source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if !check(&executable, path) {
+        return Err("Fix the RUX source errors before starting dev mode".into());
+    }
+    let mut child = spawn(&executable, path)?;
+    let interactive = enable_raw_mode().is_ok();
+    let _terminal = TerminalGuard(interactive);
+    println!("\\r\\n  RUX {}  |  DEVELOPMENT", env!("CARGO_PKG_VERSION"));
+    println!("  Source: {path}");
+    println!("  [R] Restart  [T] Tests  [S] Status  [H] Help  [Q] Quit");
+    println!("  Watching for changes...");
+
+    let mut exit_reported = false;
+    loop {
+        if interactive && event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q' | 'Q') => break,
+                        KeyCode::Char('r' | 'R') => {
+                            restart(&mut child, &executable, path)?;
+                            exit_reported = false;
+                        }
+                        KeyCode::Char('t' | 'T') => {
+                            println!("\\r\\nRUX dev: running tests...");
+                            let status = Command::new("cargo").args(["test", "--all-targets"]).status();
+                            println!("RUX dev: tests {}", if matches!(status, Ok(s) if s.success()) { "PASSED" } else { "FAILED" });
+                        }
+                        KeyCode::Char('s' | 'S') => {
+                            let status = child.try_wait().ok().flatten();
+                            println!("\\r\\nRUX dev: {} | source: {path}", if status.is_some() { "STOPPED" } else { "RUNNING" });
+                        }
+                        KeyCode::Char('h' | 'H') => println!("\\r\\n[R] Restart  [T] Run tests  [S] Show status  [H] Help  [Q] Quit"),
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            thread::sleep(Duration::from_millis(100));
+        }
+        match fs::read(path) {
+            Ok(source) if source != last_source => {
+                last_source = source;
+                thread::sleep(Duration::from_millis(200));
+                println!("\\r\\nRUX dev: source changed");
+                restart(&mut child, &executable, path)?;
+                exit_reported = false;
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("RUX dev: cannot read {path}: {error}"),
+        }
+        if !exit_reported {
+            if let Ok(Some(status)) = child.try_wait() {
+                eprintln!("RUX dev: application exited ({status}); waiting for changes or [R]");
+                exit_reported = true;
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    println!("\\r\\nRUX dev: stopped");
+    Ok(())
 }
 
 fn project_check(path: &str) {
