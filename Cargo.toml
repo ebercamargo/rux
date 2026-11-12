@@ -17,3 +17,5 @@ r2d2_sqlite = "0.25"
 
 postgres = "0.19"
 r2d2_postgres = "0.18"
+
+chrono = "0.4"
