@@ -101,6 +101,12 @@ fn allowed_host_names(ip: IpAddr, configured: Option<&str>) -> Result<Vec<String
     Ok(result)
 }
 
+fn same_origin(origin: &str, host: &str) -> bool {
+    let Ok(uri) = origin.parse::<axum::http::Uri>() else { return false; };
+    matches!(uri.scheme_str(), Some("http" | "https"))
+        && uri.authority().is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
+}
+
 async fn host_origin_guard(State(state): State<AppState>, request: Request, next: Next)
     -> Result<axum::response::Response, StatusCode>
 {
@@ -112,15 +118,10 @@ async fn host_origin_guard(State(state): State<AppState>, request: Request, next
     if !state.allowed_hosts.iter().any(|allowed| allowed == &host) {
         return Err(StatusCode::MISDIRECTED_REQUEST);
     }
-    if !matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD) {
+    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
         if let Some(origin) = request.headers().get(ORIGIN) {
             let origin = origin.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-            let uri: axum::http::Uri = origin.parse().map_err(|_| StatusCode::FORBIDDEN)?;
-            if !matches!(uri.scheme_str(), Some("http" | "https"))
-                || !uri.authority().is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host_header))
-            {
-                return Err(StatusCode::FORBIDDEN);
-            }
+            if !same_origin(origin, host_header) { return Err(StatusCode::FORBIDDEN); }
         }
     }
     Ok(next.run(request).await)
@@ -547,6 +548,14 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_origin_must_match_request_host() {
+        assert!(same_origin("http://localhost:3000", "localhost:3000"));
+        assert!(same_origin("https://api.example.com", "api.example.com"));
+        assert!(!same_origin("https://attacker.example", "api.example.com"));
+        assert!(!same_origin("http://localhost:8080", "localhost:3000"));
+        assert!(!same_origin("null", "localhost:3000"));
+    }
     #[test]
     fn remote_servers_require_explicit_host_allowlist() {
         let loopback: IpAddr = "127.0.0.1".parse().unwrap();
