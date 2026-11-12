@@ -325,6 +325,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .parse().map_err(|_| "PORT must be a valid TCP port".to_string())?;
     let address: SocketAddr = format!("{host}:{port}").parse()
         .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
+    validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
     axum::serve(listener, router)
@@ -348,9 +349,24 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .await.map_err(|e| e.to_string())
 }
 
+fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>) -> Result<(), String> {
+    if ip.is_loopback() || explicit_opt_in == Some("true") {
+        return Ok(());
+    }
+    Err("Refusing to expose unauthenticated CRUD outside localhost. Set RUX_ALLOW_UNAUTHENTICATED_REMOTE=true only in an isolated, trusted development environment; this does not enable authentication.".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_crud_requires_explicit_opt_in() {
+        assert!(validate_network_exposure("127.0.0.1".parse().unwrap(), None).is_ok());
+        assert!(validate_network_exposure("::1".parse().unwrap(), None).is_ok());
+        assert!(validate_network_exposure("0.0.0.0".parse().unwrap(), None).is_err());
+        assert!(validate_network_exposure("192.168.1.10".parse().unwrap(), Some("false")).is_err());
+        assert!(validate_network_exposure("0.0.0.0".parse().unwrap(), Some("true")).is_ok());
+    }
     #[tokio::test]
     async fn db_admission_rejects_when_saturated() {
         let state = AppState {
