@@ -14,6 +14,7 @@ struct AppState {
     html: Arc<String>,
     manifest: Arc<String>,
     api_token: Option<Arc<String>>,
+    read_token: Option<Arc<String>>,
     accepting: Arc<AtomicBool>,
     api_slots: Arc<Semaphore>,
     waiting_slots: Arc<Semaphore>,
@@ -107,14 +108,21 @@ fn token_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
+fn authorize_api(method: &axum::http::Method, authorization: Option<&str>, write_token: Option<&str>, read_token: Option<&str>) -> bool {
+    if write_token.is_none() && read_token.is_none() { return true; }
+    let Some(header) = authorization else { return false; };
+    if write_token.is_some_and(|token| token_matches(header, token)) { return true; }
+    (*method == axum::http::Method::GET || *method == axum::http::Method::HEAD)
+        && read_token.is_some_and(|token| token_matches(header, token))
+}
+
 async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
     if request.uri().path().starts_with("/api/") {
-        if let Some(expected) = state.api_token.as_deref() {
-            let authorized = request.headers().get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| token_matches(value, expected));
-            if !authorized { return Err(StatusCode::UNAUTHORIZED); }
+        let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
+            return Err(StatusCode::UNAUTHORIZED);
         }
     }
     if !state.accepting.load(Ordering::Acquire) {
@@ -335,8 +343,18 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if api_token.as_ref().is_some_and(|token| token.len() < 32) {
         return Err("RUX_API_TOKEN must contain at least 32 characters".into());
     }
+    let read_token = std::env::var("RUX_API_READ_TOKEN").ok().filter(|value| !value.is_empty());
+    if read_token.as_ref().is_some_and(|token| token.len() < 32) {
+        return Err("RUX_API_READ_TOKEN must contain at least 32 characters".into());
+    }
+    if read_token.is_some() && api_token.is_none() {
+        return Err("RUX_API_READ_TOKEN requires RUX_API_TOKEN for write operations".into());
+    }
+    if read_token.as_ref().zip(api_token.as_ref()).is_some_and(|(read, write)| read == write) {
+        return Err("RUX_API_READ_TOKEN must differ from RUX_API_TOKEN".into());
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -386,6 +404,22 @@ fn validate_network_exposure(ip: std::net::IpAddr, explicit_opt_in: Option<&str>
 mod tests {
     use super::*;
     #[test]
+    fn api_tokens_enforce_read_only_access() {
+        use axum::http::Method;
+        let write = "w".repeat(32);
+        let read = "r".repeat(32);
+        let read_header = format!("Bearer {read}");
+        let write_header = format!("Bearer {write}");
+        assert!(authorize_api(&Method::GET, Some(&read_header), Some(&write), Some(&read)));
+        assert!(authorize_api(&Method::HEAD, Some(&read_header), Some(&write), Some(&read)));
+        assert!(!authorize_api(&Method::POST, Some(&read_header), Some(&write), Some(&read)));
+        assert!(!authorize_api(&Method::PUT, Some(&read_header), Some(&write), Some(&read)));
+        assert!(!authorize_api(&Method::DELETE, Some(&read_header), Some(&write), Some(&read)));
+        assert!(authorize_api(&Method::DELETE, Some(&write_header), Some(&write), Some(&read)));
+        assert!(!authorize_api(&Method::GET, None, Some(&write), Some(&read)));
+        assert!(authorize_api(&Method::GET, None, None, None));
+    }
+    #[test]
     fn bearer_token_requires_exact_match() {
         let token = "a".repeat(32);
         assert!(token_matches(&format!("Bearer {token}"), &token));
@@ -409,6 +443,7 @@ mod tests {
             html: Arc::new(String::new()),
             manifest: Arc::new(String::new()),
             api_token: None,
+            read_token: None,
             accepting: Arc::new(AtomicBool::new(true)),
             api_slots: Arc::new(Semaphore::new(1)),
             waiting_slots: Arc::new(Semaphore::new(1)),
