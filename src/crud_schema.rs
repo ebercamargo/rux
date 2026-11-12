@@ -14,6 +14,43 @@ pub fn parse_schema(source: &str) -> Result<(String, Vec<String>), String> {
     Ok((name, fields.into_iter().map(|(name, _)| name).collect()))
 }
 
+/// Converts supported date/time pattern tokens into chrono directives.
+pub fn chrono_datetime_pattern(pattern: &str) -> Result<String, String> {
+    if pattern.is_empty() || pattern.len() > 100 { return Err("format must contain 1 to 100 characters".into()); }
+    let mut result = String::new();
+    let mut has_component = false;
+    let mut has_date = false;
+    let mut has_time = false;
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if matches!(ch, 'y' | 'M' | 'm' | 'd' | 'H' | 'h' | 's' | 'S' | 'a') {
+            let mut count = 1;
+            while chars.peek() == Some(&ch) { chars.next(); count += 1; }
+            let directive = match (ch, count) {
+                ('y', 2) => "%y", ('y', 4) => "%Y",
+                ('M', 1 | 2) => "%m", ('M', 3) => "%b", ('M', 4) => "%B",
+                ('d', 1 | 2) => "%d",
+                ('H', 1 | 2) => "%H", ('h', 1 | 2) => "%I",
+                ('m', 1 | 2) => if pattern.contains('H') || pattern.contains('h') || pattern.contains('s') { "%M" } else { "%m" },
+                ('s', 1 | 2) => "%S",
+                ('S', 1..=9) => "%f",
+                ('a', 1) => "%p",
+                _ => return Err(format!("unsupported date/time token: {}", ch.to_string().repeat(count))),
+            };
+            has_component = true;
+            has_date |= matches!(ch, 'y' | 'M' | 'd') || (ch == 'm' && directive == "%m");
+            has_time |= matches!(ch, 'H' | 'h' | 's' | 'S' | 'a') || (ch == 'm' && directive == "%M");
+            result.push_str(directive);
+        } else if matches!(ch, '-' | '/' | '.' | ':' | ' ' | 'T' | ',' | '_') {
+            result.push(ch);
+        } else {
+            return Err(format!("unsupported date/time format character: {ch}"));
+        }
+    }
+    if !has_component || (!has_date && !has_time) { return Err("format must contain date or time tokens".into()); }
+    Ok(result)
+}
+
 pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>), String> {
     let mut app = None;
     let mut entity = None;
@@ -96,11 +133,8 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
                     return Err(format!("line {}: DateTime requires a quoted format", index + 1));
                 }
                 let pattern = &pattern[1..pattern.len() - 1];
-                let allowed = ["dd/MM/yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "dd.MM.yyyy",
-                    "dd/MM/yyyy HH:mm:ss", "dd/MM/yyyy HH:mm:ss.SSS", "HH:mm:ss", "MM/yyyy"];
-                if !allowed.contains(&pattern) {
-                    return Err(format!("line {}: unsupported DateTime format: {pattern}", index + 1));
-                }
+                chrono_datetime_pattern(pattern)
+                    .map_err(|error| format!("line {}: invalid DateTime format: {error}", index + 1))?;
                 format!("DateTime|{pattern}")
             } else { ty.to_string() };
             if !matches!(ty.as_str(), "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") && !ty.starts_with("DateTime|") && !ty.starts_with("Text|") {
