@@ -68,6 +68,10 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
         let value = object.get(name).and_then(Value::as_str).ok_or(StatusCode::BAD_REQUEST)?;
         let value = value.trim();
         if value.is_empty() || value.len() > 250 { return Err(StatusCode::BAD_REQUEST); }
+        let (kind, regex_pattern) = match kind.split_once('~') {
+            Some((base, pattern)) => (base, Some(pattern)),
+            None => (kind.as_str(), None),
+        };
         let valid = if let Some(pattern) = kind.strip_prefix("Text|") {
             valid_mask(value, pattern)
         } else if let Some(pattern) = kind.strip_prefix("DateTime|") {
@@ -84,7 +88,9 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
                 && value.chars().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
             _ => true,
         }};
-        if !valid { return Err(StatusCode::BAD_REQUEST); }
+        if !valid || regex_pattern.is_some_and(|pattern| regex::Regex::new(pattern).map_or(true, |regex| !regex.is_match(value))) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         result.insert(name.clone(), Value::String(value.to_string()));
     }
     Ok(result)
