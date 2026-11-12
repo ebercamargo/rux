@@ -124,6 +124,7 @@ fn dev(path: &str) -> Result<(), String> {
                             if valid(&exe, path) {
                                 let _ = child.kill(); let _ = child.wait();
                                 child = launch(&exe, path, &tx)?;
+                                console.clear_endpoint();
                                 console.status = "RUNNING".into();
                                 console.log("SUCCESS", "Application restarted");
                                 exit_reported = false;
@@ -165,6 +166,7 @@ fn dev(path: &str) -> Result<(), String> {
                 if valid(&exe, path) {
                     let _ = child.kill(); let _ = child.wait();
                     child = launch(&exe, path, &tx)?;
+                    console.clear_endpoint();
                     console.status = "RUNNING".into();
                     console.log("SUCCESS", "Source changed; application restarted");
                     exit_reported = false;
@@ -175,6 +177,7 @@ fn dev(path: &str) -> Result<(), String> {
         if !exit_reported {
             if let Ok(Some(status)) = child.try_wait() {
                 console.status = "STOPPED".into();
+                console.clear_endpoint();
                 console.log("WARN", &format!("Application exited: {status}"));
                 exit_reported = true;
             }
