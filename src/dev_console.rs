@@ -23,7 +23,7 @@ impl DevConsole {
                 return Self { active: false, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), server_url: None, scroll: 0 };
             }
         }
-        Self { active, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), scroll: 0 }
+        Self { active, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), server_url: None, scroll: 0 }
     }
 
     pub fn log(&mut self, level: &str, message: &str) {
