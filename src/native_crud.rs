@@ -7,6 +7,19 @@ use tokio::sync::Semaphore;
 use std::time::{Duration, Instant};
 use axum::{middleware::{self, Next}, extract::Request};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthMode { Legacy, Identities }
+
+impl AuthMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "legacy" => Ok(Self::Legacy),
+            "identities" => Ok(Self::Identities),
+            _ => Err("RUX_AUTH_MODE must be legacy or identities".into()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     db: r2d2::Pool<SqliteConnectionManager>,
@@ -15,6 +28,7 @@ struct AppState {
     manifest: Arc<String>,
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
+    auth_mode: AuthMode,
     allowed_hosts: Arc<Vec<String>>,
     rate_windows: Arc<Mutex<HashMap<IpAddr, ClientWindow>>>,
     rate_limit_per_minute: u32,
@@ -210,13 +224,34 @@ fn authorize_api(method: &axum::http::Method, authorization: Option<&str>, write
         && read_token.is_some_and(|token| token_matches(header, token))
 }
 
+async fn check_identity(state: &AppState, authorization: Option<&str>, operation: &str) -> Result<(), StatusCode> {
+    let pool = state.db.clone();
+    let bearer = authorization.map(str::to_owned);
+    let operation = operation.to_owned();
+    let decision = tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::identity::authorize(&db, bearer.as_deref(), &operation)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    match decision {
+        super::identity::Decision::Allowed => Ok(()),
+        super::identity::Decision::Unauthenticated => Err(StatusCode::UNAUTHORIZED),
+        super::identity::Decision::Forbidden => Err(StatusCode::FORBIDDEN),
+    }
+}
+
 async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
     if request.uri().path().starts_with("/api/") {
         let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
-            return Err(StatusCode::UNAUTHORIZED);
+        match state.auth_mode {
+            AuthMode::Legacy => {
+                if !authorize_api(request.method(), authorization, state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            AuthMode::Identities => check_identity(&state, authorization, request.method().as_str()).await?,
         }
     }
     if !state.accepting.load(Ordering::Acquire) {
@@ -251,11 +286,16 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
 }
 
 async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
-    let authorized = state.api_token.as_deref().is_some_and(|expected|
-        headers.get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| token_matches(value, expected)));
-    if !authorized { return Err(StatusCode::UNAUTHORIZED); }
+    let bearer = headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    match state.auth_mode {
+        AuthMode::Identities => check_identity(&state, bearer, "METRICS").await?,
+        AuthMode::Legacy => {
+            let authorized = state.api_token.as_deref()
+                .is_some_and(|expected| bearer.is_some_and(|value| token_matches(value, expected)));
+            if !authorized { return Err(StatusCode::UNAUTHORIZED); }
+        }
+    }
     Ok(Json(json!({
         "requests_total": state.requests_total.load(Ordering::Relaxed),
         "rejected_total": state.rejected_total.load(Ordering::Relaxed),
@@ -416,9 +456,12 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         return Err("RUX_DB_POOL_SIZE must be between 1 and 128".into());
     }
     let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
-    db.get().map_err(|e| e.to_string())?
-        .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
-        .map_err(|e| e.to_string())?;
+    {
+        let connection = db.get().map_err(|e| e.to_string())?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
+            .map_err(|e| e.to_string())?;
+        super::identity::initialize(&connection).map_err(|e| e.to_string())?;
+    }
     let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "120".into())
         .parse().map_err(|_| "RUX_RATE_LIMIT_PER_MINUTE must be an integer".to_string())?;
@@ -456,17 +499,20 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .map_err(|_| "RUX_HOST must be an IPv4 or IPv6 address".to_string())?;
     validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let allowed_hosts = allowed_host_names(address.ip(), std::env::var("RUX_ALLOWED_HOSTS").ok().as_deref())?;
+    let auth_mode = AuthMode::parse(&std::env::var("RUX_AUTH_MODE").unwrap_or_else(|_| "legacy".into()))?;
     let api_token = std::env::var("RUX_API_TOKEN").ok().filter(|value| !value.is_empty());
-    if !address.ip().is_loopback() && api_token.as_ref().is_none_or(|token| token.len() < 32) {
-        return Err("Remote CRUD requires RUX_API_TOKEN with at least 32 characters. Use TLS at a trusted reverse proxy; this is not a full user authentication system.".into());
+    if auth_mode == AuthMode::Legacy && !address.ip().is_loopback()
+        && api_token.as_ref().is_none_or(|token| token.len() < 32) {
+        return Err("Remote legacy CRUD requires RUX_API_TOKEN with at least 32 characters; consider RUX_AUTH_MODE=identities".into());
     }
     if api_token.as_ref().is_some_and(|token| token.len() < 32) {
         return Err("RUX_API_TOKEN must contain at least 32 characters".into());
     }
     let environment = std::env::var("RUX_ENV").unwrap_or_else(|_| "development".into());
-    validate_runtime_environment(&environment, api_token.as_deref())?;
-    if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true") && api_token.is_none() {
-        return Err("RUX_EXPOSE_METRICS=true requires RUX_API_TOKEN; metrics may expose operational information".into());
+    validate_runtime_environment(&environment, auth_mode, api_token.as_deref())?;
+    if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true")
+        && auth_mode == AuthMode::Legacy && api_token.is_none() {
+        return Err("RUX_EXPOSE_METRICS=true requires RUX_API_TOKEN in legacy mode".into());
     }
     let read_token = std::env::var("RUX_API_READ_TOKEN").ok().filter(|value| !value.is_empty());
     if read_token.as_ref().is_some_and(|token| token.len() < 32) {
@@ -478,8 +524,17 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     if read_token.as_ref().zip(api_token.as_ref()).is_some_and(|(read, write)| read == write) {
         return Err("RUX_API_READ_TOKEN must differ from RUX_API_TOKEN".into());
     }
+    if auth_mode == AuthMode::Identities {
+        if api_token.is_some() || read_token.is_some() {
+            return Err("RUX_AUTH_MODE=identities does not use RUX_API_TOKEN or RUX_API_READ_TOKEN; remove these shared credentials".into());
+        }
+        let connection = db.get().map_err(|e| e.to_string())?;
+        if super::identity::active_count(&connection).map_err(|e| e.to_string())? == 0 {
+            return Err("RUX_AUTH_MODE=identities requires at least one active identity. Run: rux identity create <app-directory> <name> admin".into());
+        }
+    }
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
     let state_for_host = state.clone();
     let router = Router::new()
@@ -524,12 +579,13 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .await.map_err(|e| e.to_string())
 }
 
-fn validate_runtime_environment(environment: &str, api_token: Option<&str>) -> Result<(), String> {
+fn validate_runtime_environment(environment: &str, mode: AuthMode, api_token: Option<&str>) -> Result<(), String> {
     match environment {
         "development" | "test" => Ok(()),
+        "production" if mode == AuthMode::Identities => Ok(()),
         "production" => {
             if api_token.is_none_or(|token| token.len() < 32) {
-                Err("Production mode requires RUX_API_TOKEN with at least 32 characters. Configure HTTPS at the ingress or reverse proxy and implement user authentication before serving sensitive data.".into())
+                Err("Production legacy mode requires RUX_API_TOKEN with at least 32 characters. Prefer RUX_AUTH_MODE=identities and HTTPS at ingress.".into())
             } else {
                 Ok(())
             }
@@ -581,14 +637,20 @@ mod tests {
         assert!(within_rate_limit(&windows, first, 2, now + Duration::from_secs(60)));
     }
     #[test]
+    fn identity_mode_is_explicit_and_production_compatible() {
+        assert_eq!(AuthMode::parse("identities").unwrap(), AuthMode::Identities);
+        assert!(AuthMode::parse("anonymous").is_err());
+        assert!(validate_runtime_environment("production", AuthMode::Identities, None).is_ok());
+    }
+    #[test]
     fn production_requires_api_credentials() {
         let strong = "a".repeat(32);
-        assert!(validate_runtime_environment("development", None).is_ok());
-        assert!(validate_runtime_environment("test", None).is_ok());
-        assert!(validate_runtime_environment("production", None).is_err());
-        assert!(validate_runtime_environment("production", Some("short")).is_err());
-        assert!(validate_runtime_environment("production", Some(&strong)).is_ok());
-        assert!(validate_runtime_environment("prod", Some(&strong)).is_err());
+        assert!(validate_runtime_environment("development", AuthMode::Legacy, None).is_ok());
+        assert!(validate_runtime_environment("test", AuthMode::Legacy, None).is_ok());
+        assert!(validate_runtime_environment("production", AuthMode::Legacy, None).is_err());
+        assert!(validate_runtime_environment("production", AuthMode::Legacy, Some("short")).is_err());
+        assert!(validate_runtime_environment("production", AuthMode::Legacy, Some(&strong)).is_ok());
+        assert!(validate_runtime_environment("prod", AuthMode::Legacy, Some(&strong)).is_err());
     }
     #[test]
     fn accepts_flexible_date_time_formats() {
@@ -641,6 +703,7 @@ mod tests {
             manifest: Arc::new(String::new()),
             api_token: None,
             read_token: None,
+            auth_mode: AuthMode::Legacy,
             allowed_hosts: Arc::new(vec!["localhost".into()]),
             rate_windows: Arc::new(Mutex::new(HashMap::new())),
             rate_limit_per_minute: 120,
