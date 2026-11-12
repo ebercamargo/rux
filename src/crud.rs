@@ -146,10 +146,14 @@ function element(tag,text){const e=document.createElement(tag);if(text!==undefin
 for(const field of fields){
  const label=element("label",field);const input=document.createElement("input");
  input.name=field;input.required=true;input.maxLength=250;input.autocomplete="off";
- if(fieldTypes[field]==="Date"||fieldTypes[field]==="DateTime|yyyy-MM-dd")input.type="date";
- else if(fieldTypes[field]&&fieldTypes[field].startsWith("DateTime|")){input.type="text";input.placeholder=fieldTypes[field].slice(9);input.title="Formato: "+input.placeholder;}
- else if(fieldTypes[field]&&fieldTypes[field].startsWith("Text|")){
-  const mask=fieldTypes[field].slice(5);
+ const regexSeparator=fieldTypes[field]?.indexOf("~")??-1;
+ const validationRegex=regexSeparator>=0?fieldTypes[field].slice(regexSeparator+1):null;
+ const declaredType=regexSeparator>=0?fieldTypes[field].slice(0,regexSeparator):fieldTypes[field];
+ if(validationRegex){input.pattern=validationRegex;input.title="Formato inválido";}
+ if(declaredType==="Date"||declaredType==="DateTime|yyyy-MM-dd")input.type="date";
+ else if(declaredType&&declaredType.startsWith("DateTime|")){input.type="text";input.placeholder=declaredType.slice(9);input.title="Formato: "+input.placeholder;}
+ else if(declaredType&&declaredType.startsWith("Text|")){
+  const mask=declaredType.slice(5);
   input.type="text";input.placeholder=mask;input.maxLength=mask.length;
   input.addEventListener("input",()=>{const formatted=applyDigitMask(input.value,mask);if(input.value!==formatted)input.value=formatted;});
  }
