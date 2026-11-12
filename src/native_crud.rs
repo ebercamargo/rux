@@ -76,7 +76,7 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
             valid_mask(value, pattern)
         } else if let Some(pattern) = kind.strip_prefix("DateTime|") {
             valid_datetime(value, pattern)
-        } else { match kind.as_str() {
+        } else { match kind {
             "Email" => {
                 let parts: Vec<_> = value.split('@').collect();
                 parts.len() == 2 && !parts[0].is_empty() && parts[1].contains('.') && !value.contains(char::is_whitespace)
