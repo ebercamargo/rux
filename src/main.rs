@@ -183,7 +183,7 @@ fn dev(path: &str) -> Result<(), String> {
         match fs::read(path) {
             Ok(next) if next != source => {
                 source = next;
-                if valid(&exe, path) {
+                if validate_source(&exe, path).is_ok() {
                     let _ = child.kill(); let _ = child.wait();
                     child = launch(&exe, path, &tx)?;
                     console.clear_endpoint();
