@@ -67,6 +67,44 @@ fn execute_file(command: &str, path: &str) {
     }
 }
 
+fn dev_footer(interactive: bool) {
+    if !interactive { return; }
+    use crossterm::{cursor, execute, style::{Color, Print, ResetColor, SetForegroundColor}, terminal::{self, Clear, ClearType}};
+    use std::io::stdout;
+    let Ok((width, height)) = terminal::size() else { return; };
+    if height == 0 { return; }
+    let actions = [("[R]", "Restart"), ("[T]", "Tests"), ("[S]", "Status"), ("[H]", "Help"), ("[Q]", "Quit")];
+    let mut out = stdout();
+    let _ = execute!(out, cursor::SavePosition, cursor::MoveTo(0, height - 1), Clear(ClearType::CurrentLine));
+    let mut used = 0usize;
+    for (key, label) in actions {
+        let needed = key.len() + label.len() + 3;
+        if used + needed > usize::from(width) { break; }
+        let _ = execute!(out, SetForegroundColor(Color::Cyan), Print(key), ResetColor, Print(format!(" {label}  ")));
+        used += needed;
+    }
+    let _ = execute!(out, cursor::RestorePosition);
+}
+
+fn dev_log(interactive: bool, level: &str, message: &str) {
+    use crossterm::{execute, style::{Color, Print, ResetColor, SetForegroundColor}};
+    use std::io::stdout;
+    if interactive {
+        let color = match level {
+            "DEBUG" => Color::DarkGrey,
+            "INFO" => Color::Blue,
+            "SUCCESS" => Color::Green,
+            "WARN" => Color::Yellow,
+            "ERROR" => Color::Red,
+            _ => Color::White,
+        };
+        let _ = execute!(stdout(), SetForegroundColor(color), Print(format!("[{level}]")), ResetColor, Print(format!(" {message}\\r\\n")));
+        dev_footer(true);
+    } else {
+        println!("[{level}] {message}");
+    }
+}
+
 fn dev(path: &str) -> Result<(), String> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -108,8 +146,8 @@ fn dev(path: &str) -> Result<(), String> {
     let _terminal = TerminalGuard(interactive);
     println!("\\r\\n  RUX {}  |  DEVELOPMENT", env!("CARGO_PKG_VERSION"));
     println!("  Source: {path}");
-    println!("  [R] Restart  [T] Tests  [S] Status  [H] Help  [Q] Quit");
-    println!("  Watching for changes...");
+    dev_log(interactive, "INFO", "Watching for changes...");
+    dev_footer(interactive);
 
     let mut exit_reported = false;
     loop {
@@ -123,15 +161,16 @@ fn dev(path: &str) -> Result<(), String> {
                             exit_reported = false;
                         }
                         KeyCode::Char('t' | 'T') => {
-                            println!("\\r\\nRUX dev: running tests...");
+                            dev_log(interactive, "INFO", "Running tests...");
                             let status = Command::new("cargo").args(["test", "--all-targets"]).status();
-                            println!("RUX dev: tests {}", if matches!(status, Ok(s) if s.success()) { "PASSED" } else { "FAILED" });
+                            let passed = matches!(status, Ok(s) if s.success());
+                            dev_log(interactive, if passed { "SUCCESS" } else { "ERROR" }, if passed { "Tests passed" } else { "Tests failed" });
                         }
                         KeyCode::Char('s' | 'S') => {
                             let status = child.try_wait().ok().flatten();
-                            println!("\\r\\nRUX dev: {} | source: {path}", if status.is_some() { "STOPPED" } else { "RUNNING" });
+                            dev_log(interactive, "INFO", &format!("{} | source: {path}", if status.is_some() { "STOPPED" } else { "RUNNING" }));
                         }
-                        KeyCode::Char('h' | 'H') => println!("\\r\\n[R] Restart  [T] Run tests  [S] Show status  [H] Help  [Q] Quit"),
+                        KeyCode::Char('h' | 'H') => dev_log(interactive, "INFO", "R Restart | T Run tests | S Show status | H Help | Q Quit"),
                         _ => {}
                     }
                 }
@@ -143,7 +182,7 @@ fn dev(path: &str) -> Result<(), String> {
             Ok(source) if source != last_source => {
                 last_source = source;
                 thread::sleep(Duration::from_millis(200));
-                println!("\\r\\nRUX dev: source changed");
+                dev_log(interactive, "DEBUG", "Source changed");
                 restart(&mut child, &executable, path)?;
                 exit_reported = false;
             }
@@ -152,14 +191,14 @@ fn dev(path: &str) -> Result<(), String> {
         }
         if !exit_reported {
             if let Ok(Some(status)) = child.try_wait() {
-                eprintln!("RUX dev: application exited ({status}); waiting for changes or [R]");
+                dev_log(interactive, "WARN", &format!("Application exited ({status}); waiting for changes or [R]"));
                 exit_reported = true;
             }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    println!("\\r\\nRUX dev: stopped");
+    dev_log(interactive, "INFO", "Development server stopped");
     Ok(())
 }
 
