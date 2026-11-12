@@ -1,5 +1,5 @@
 use std::{net::SocketAddr, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}};
-use axum::{extract::{Path as RoutePath, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::get, Json, Router};
+use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::get, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
@@ -149,14 +149,33 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
     Ok(response)
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
+    let authorized = state.api_token.as_deref().is_some_and(|expected|
+        headers.get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| token_matches(value, expected)));
+    if !authorized { return Err(StatusCode::UNAUTHORIZED); }
+    Ok(Json(json!({
         "requests_total": state.requests_total.load(Ordering::Relaxed),
         "rejected_total": state.rejected_total.load(Ordering::Relaxed),
         "request_duration_micros_total": state.request_duration_micros.load(Ordering::Relaxed),
         "api_slots_available": state.api_slots.available_permits(),
         "queued_slots_available": state.waiting_slots.available_permits()
-    }))
+    })))
+}
+
+async fn security_headers(request: Request, next: Next) -> axum::response::Response {
+    use axum::http::header::{HeaderValue, CACHE_CONTROL};
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert("permissions-policy", HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
+    headers.insert("content-security-policy", HeaderValue::from_static("frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"));
+    if is_api { headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store")); }
+    response
 }
 
 async fn health_live() -> impl IntoResponse {
@@ -338,6 +357,9 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     }
     let environment = std::env::var("RUX_ENV").unwrap_or_else(|_| "development".into());
     validate_runtime_environment(&environment, api_token.as_deref())?;
+    if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true") && api_token.is_none() {
+        return Err("RUX_EXPOSE_METRICS=true requires RUX_API_TOKEN; metrics may expose operational information".into());
+    }
     let read_token = std::env::var("RUX_API_READ_TOKEN").ok().filter(|value| !value.is_empty());
     if read_token.as_ref().is_some_and(|token| token.len() < 32) {
         return Err("RUX_API_READ_TOKEN must contain at least 32 characters".into());
@@ -365,6 +387,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     } else {
         router
     };
+    let router = router.layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(middleware::from_fn(security_headers));
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
     axum::serve(listener, router)
