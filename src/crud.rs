@@ -92,6 +92,16 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 "use strict";
 const fields=[__RUX_FIELDS__];
 const fieldTypes={__RUX_TYPES__};
+function applyDigitMask(value,pattern){
+ const digits=String(value).replace(/[^0-9]/g,"");
+ let result="",position=0;
+ for(const symbol of pattern){
+  if(position>=digits.length)break;
+  if(symbol==="9")result+=digits[position++];
+  else result+=symbol;
+ }
+ return result;
+}
 function isoDate(value){const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
 const key="rux:crud:__RUX_TITLE__:v1";
 const form=document.getElementById("record-form");
@@ -138,6 +148,11 @@ for(const field of fields){
  input.name=field;input.required=true;input.maxLength=250;input.autocomplete="off";
  if(fieldTypes[field]==="Date"||fieldTypes[field]==="DateTime|yyyy-MM-dd")input.type="date";
  else if(fieldTypes[field]&&fieldTypes[field].startsWith("DateTime|")){input.type="text";input.placeholder=fieldTypes[field].slice(9);input.title="Formato: "+input.placeholder;}
+ else if(fieldTypes[field]&&fieldTypes[field].startsWith("Text|")){
+  const mask=fieldTypes[field].slice(5);
+  input.type="text";input.placeholder=mask;input.maxLength=mask.length;
+  input.addEventListener("input",()=>{const formatted=applyDigitMask(input.value,mask);if(input.value!==formatted)input.value=formatted;});
+ }
  else if(fieldTypes[field]==="Email")input.type="email";
  else if(fieldTypes[field]==="Int"){input.type="number";input.step="1";}
  else if(fieldTypes[field]==="Decimal"){input.type="number";input.step="any";}
