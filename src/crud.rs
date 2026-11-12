@@ -136,7 +136,8 @@ function element(tag,text){const e=document.createElement(tag);if(text!==undefin
 for(const field of fields){
  const label=element("label",field);const input=document.createElement("input");
  input.name=field;input.required=true;input.maxLength=250;input.autocomplete="off";
- if(fieldTypes[field]==="Date")input.type="date";
+ if(fieldTypes[field]==="Date"||fieldTypes[field]==="DateTime|yyyy-MM-dd")input.type="date";
+ else if(fieldTypes[field]&&fieldTypes[field].startsWith("DateTime|")){input.type="text";input.placeholder=fieldTypes[field].slice(9);input.title="Formato: "+input.placeholder;}
  else if(fieldTypes[field]==="Email")input.type="email";
  else if(fieldTypes[field]==="Int"){input.type="number";input.step="1";}
  else if(fieldTypes[field]==="Decimal"){input.type="number";input.step="any";}
