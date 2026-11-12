@@ -63,10 +63,23 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
             let (field, ty) = line.split_once(':').ok_or_else(|| format!("line {}: expected field: Type", index + 1))?;
             let field = field.trim();
             let ty = ty.trim();
-            if !matches!(ty, "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") {
+            let ty = if let Some(pattern) = ty.strip_prefix("DateTime,") {
+                let pattern = pattern.trim();
+                if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
+                    return Err(format!("line {}: DateTime requires a quoted format", index + 1));
+                }
+                let pattern = &pattern[1..pattern.len() - 1];
+                let allowed = ["dd/MM/yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "dd.MM.yyyy",
+                    "dd/MM/yyyy HH:mm:ss", "dd/MM/yyyy HH:mm:ss.SSS", "HH:mm:ss", "MM/yyyy"];
+                if !allowed.contains(&pattern) {
+                    return Err(format!("line {}: unsupported DateTime format: {pattern}", index + 1));
+                }
+                format!("DateTime|{pattern}")
+            } else { ty.to_string() };
+            if !matches!(ty.as_str(), "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") && !ty.starts_with("DateTime|") {
                 return Err(format!("line {}: unsupported field type: {ty}", index + 1));
             }
-            fields.push((field.to_string(), ty.to_string()));
+            fields.push((field.to_string(), ty));
             continue;
         }
         return Err(format!("line {}: unsupported declaration", index + 1));
