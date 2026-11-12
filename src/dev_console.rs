@@ -10,6 +10,7 @@ pub struct DevConsole {
     lines: VecDeque<String>,
     pub source: String,
     pub status: String,
+    pub server_url: Option<String>,
     scroll: usize,
 }
 
@@ -19,13 +20,18 @@ impl DevConsole {
         if active {
             if execute!(stdout(), EnterAlternateScreen, cursor::Hide).is_err() {
                 let _ = terminal::disable_raw_mode();
-                return Self { active: false, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), scroll: 0 };
+                return Self { active: false, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), server_url: None, scroll: 0 };
             }
         }
         Self { active, lines: VecDeque::new(), source: source.into(), status: "STARTING".into(), scroll: 0 }
     }
 
     pub fn log(&mut self, level: &str, message: &str) {
+        if let Some(url) = message.strip_prefix("RUX native CRUD: ").and_then(|line| line.split_whitespace().next()) {
+            if url.starts_with("http://") || url.starts_with("https://") {
+                self.server_url = Some(url.to_string());
+            }
+        }
         let entry = format!("[{level}] {message}");
         if !self.active { println!("{entry}"); return; }
         for line in entry.lines() {
@@ -35,6 +41,8 @@ impl DevConsole {
         self.scroll = 0;
         self.render();
     }
+
+    pub fn clear_endpoint(&mut self) { self.server_url = None; self.render(); }
 
     pub fn scroll_up(&mut self) { self.scroll = self.scroll.saturating_add(3); self.render(); }
     pub fn scroll_down(&mut self) { self.scroll = self.scroll.saturating_sub(3); self.render(); }
@@ -49,8 +57,15 @@ impl DevConsole {
         let _ = queue!(out, SetForegroundColor(Color::Cyan), Print(truncate(&heading, width)), ResetColor);
         let _ = queue!(out, cursor::MoveTo(0, 1), Print(truncate(&format!(" Source: {}", self.source), width)));
         let rule = "-".repeat(width as usize);
-        let _ = queue!(out, cursor::MoveTo(0, 2), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
-        let available = (height - 5) as usize;
+        let endpoint = self.server_url.as_deref().unwrap_or("Waiting for server...");
+        let port = self.server_url.as_deref().and_then(|url| url.split("://").nth(1))
+            .and_then(|authority| authority.split('/').next())
+            .and_then(|authority| authority.rsplit_once(':'))
+            .map(|(_, port)| port).unwrap_or("--");
+        let _ = queue!(out, cursor::MoveTo(0, 2), SetForegroundColor(Color::Green),
+            Print(truncate(&format!(" URL: {endpoint}  |  Port: {port}"), width)), ResetColor);
+        let _ = queue!(out, cursor::MoveTo(0, 3), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
+        let available = (height - 6) as usize;
         let end = self.lines.len().saturating_sub(self.scroll.min(self.lines.len()));
         let start = end.saturating_sub(available);
         for (index, line) in self.lines.iter().skip(start).take(available).enumerate() {
@@ -60,7 +75,7 @@ impl DevConsole {
                 else if line.starts_with("[SUCCESS]") { Color::Green }
                 else if line.starts_with("[INFO]") { Color::Blue }
                 else { Color::White };
-            let _ = queue!(out, cursor::MoveTo(0, index as u16 + 3), SetForegroundColor(color), Print(truncate(line, width)), ResetColor);
+            let _ = queue!(out, cursor::MoveTo(0, index as u16 + 4), SetForegroundColor(color), Print(truncate(line, width)), ResetColor);
         }
         let _ = queue!(out, cursor::MoveTo(0, height - 2), SetForegroundColor(Color::DarkGrey), Print(&rule), ResetColor);
         let actions = "[R] Restart  [T] Tests  [S] Status  [H] Help  [Q] Quit  [Up/Down] Scroll";
