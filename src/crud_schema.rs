@@ -63,6 +63,86 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
             let (field, ty) = line.split_once(':').ok_or_else(|| format!("line {}: expected field: Type", index + 1))?;
             let field = field.trim();
             let ty = ty.trim();
+            let (ty, regex_pattern) = if let Some((base, expression)) = ty.split_once(", regex(") {
+                let expression = expression.strip_suffix(')').ok_or_else(|| format!("line {}: invalid regex declaration", index + 1))?;
+                let pattern = expression.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                    .ok_or_else(|| format!("line {}: regex must be quoted", index + 1))?;
+                if pattern.is_empty() || pattern.len() > 200 || !pattern.starts_with('^') || !pattern.ends_with('
+            let ty = if let Some(pattern) = ty.strip_prefix("Text,") {
+                let pattern = pattern.trim();
+                if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
+                    return Err(format!("line {}: Text mask requires a quoted pattern", index + 1));
+                }
+                let pattern = &pattern[1..pattern.len() - 1];
+                if pattern.len() > 64 || !pattern.contains('9') || !pattern.chars().all(|ch| ch == '9' || " .-/()+".contains(ch)) {
+                    return Err(format!("line {}: invalid Text mask (use 9 for digits)", index + 1));
+                }
+                format!("Text|{pattern}")
+            } else if let Some(pattern) = ty.strip_prefix("DateTime,") {
+                let pattern = pattern.trim();
+                if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
+                    return Err(format!("line {}: DateTime requires a quoted format", index + 1));
+                }
+                let pattern = &pattern[1..pattern.len() - 1];
+                let allowed = ["dd/MM/yyyy", "yyyy-MM-dd", "MM/dd/yyyy", "dd.MM.yyyy",
+                    "dd/MM/yyyy HH:mm:ss", "dd/MM/yyyy HH:mm:ss.SSS", "HH:mm:ss", "MM/yyyy"];
+                if !allowed.contains(&pattern) {
+                    return Err(format!("line {}: unsupported DateTime format: {pattern}", index + 1));
+                }
+                format!("DateTime|{pattern}")
+            } else { ty.to_string() };
+            if !matches!(ty.as_str(), "Text" | "Email" | "Int" | "Decimal" | "Bool" | "Date") && !ty.starts_with("DateTime|") && !ty.starts_with("Text|") {
+                return Err(format!("line {}: unsupported field type: {ty}", index + 1));
+            }
+            if regex_pattern.is_some() && ty != "Text" && !ty.starts_with("Text|") {
+                return Err(format!("line {}: regex is currently supported only for Text", index + 1));
+            }
+            let ty = match regex_pattern { Some(pattern) => format!("{ty}~{pattern}"), None => ty };
+            fields.push((field.to_string(), ty));
+            continue;
+        }
+        return Err(format!("line {}: unsupported declaration", index + 1));
+    }
+    if depth != 0 || app_depth.is_none() || entity.is_none() || fields.is_empty() {
+        return Err("expected a closed app containing one data entity with fields".into());
+    }
+    let name = app.unwrap();
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("invalid app name".into());
+    }
+    let mut unique = std::collections::HashSet::new();
+    if fields.len() > 20 || fields.iter().any(|(f, _)| f == "id" || !f.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) || !f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || !unique.insert(f.clone())) {
+        return Err("invalid, duplicate or reserved field (maximum 20)".into());
+    }
+    Ok((name, fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn parses_schema() {
+        let src = "app Clientes {\n data Cliente {\n nome: Text\n email: Email\n idade: Int\n }\n}";
+        assert_eq!(parse_schema(src).unwrap(), ("Clientes".into(), vec!["nome".to_string(), "email".to_string(), "idade".to_string()]));
+    }
+    #[test]
+    fn rejects_invalid_type() {
+        assert!(parse_schema("app A {\n data X {\n a: Unknown\n }\n}").is_err());
+    }
+    #[test]
+    fn rejects_unclosed_app() {
+        assert!(parse_schema("app A {\n data X {\n a: Text\n }").is_err());
+    }
+}
+)
+                    || pattern.contains('"') || pattern.contains('\\') {
+                    return Err(format!("line {}: regex must be anchored, at most 200 characters and use no backslash or quote", index + 1));
+                }
+                regex::Regex::new(pattern).map_err(|e| format!("line {}: invalid regex: {e}", index + 1))?;
+                (base.trim(), Some(pattern))
+            } else { (ty, None) };
+
             let ty = if let Some(pattern) = ty.strip_prefix("Text,") {
                 let pattern = pattern.trim();
                 if !pattern.starts_with('"') || !pattern.ends_with('"') || pattern.len() < 3 {
