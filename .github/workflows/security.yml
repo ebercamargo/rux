@@ -1,0 +1,24 @@
+name: Security - dependency audit
+
+on:
+  push:
+    branches: [main, develop, feat/v1-runtime-performance]
+  pull_request:
+  schedule:
+    - cron: '15 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: Install RustSec auditor
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies for known advisories
+        run: cargo audit
