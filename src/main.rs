@@ -1,3 +1,4 @@
+mod dev_console;
 use std::{env, fs, path::Path, process};
 
 fn create_project(name: &str) -> Result<(), String> {
@@ -67,138 +68,111 @@ fn execute_file(command: &str, path: &str) {
     }
 }
 
-fn dev_footer(interactive: bool) {
-    if !interactive { return; }
-    use crossterm::{cursor, execute, style::{Color, Print, ResetColor, SetForegroundColor}, terminal::{self, Clear, ClearType}};
-    use std::io::stdout;
-    let Ok((width, height)) = terminal::size() else { return; };
-    if height == 0 { return; }
-    let actions = [("[R]", "Restart"), ("[T]", "Tests"), ("[S]", "Status"), ("[H]", "Help"), ("[Q]", "Quit")];
-    let mut out = stdout();
-    let _ = execute!(out, cursor::SavePosition, cursor::MoveTo(0, height - 1), Clear(ClearType::CurrentLine));
-    let mut used = 0usize;
-    for (key, label) in actions {
-        let needed = key.len() + label.len() + 3;
-        if used + needed > usize::from(width) { break; }
-        let _ = execute!(out, SetForegroundColor(Color::Cyan), Print(key), ResetColor, Print(format!(" {label}  ")));
-        used += needed;
-    }
-    let _ = execute!(out, cursor::RestorePosition);
-}
-
-fn dev_log(interactive: bool, level: &str, message: &str) {
-    use crossterm::{execute, style::{Color, Print, ResetColor, SetForegroundColor}};
-    use std::io::stdout;
-    if interactive {
-        let color = match level {
-            "DEBUG" => Color::DarkGrey,
-            "INFO" => Color::Blue,
-            "SUCCESS" => Color::Green,
-            "WARN" => Color::Yellow,
-            "ERROR" => Color::Red,
-            _ => Color::White,
-        };
-        let _ = execute!(stdout(), SetForegroundColor(color), Print(format!("[{level}]")), ResetColor, Print(format!(" {message}\\r\\n")));
-        dev_footer(true);
-    } else {
-        println!("[{level}] {message}");
-    }
-}
-
 fn dev(path: &str) -> Result<(), String> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-    use std::{process::{Child, Command}, thread, time::Duration};
+    use std::{io::{BufRead, BufReader}, process::{Child, Command, Stdio}, sync::mpsc::{self, Sender}, thread, time::Duration};
 
-    struct TerminalGuard(bool);
-    impl Drop for TerminalGuard {
-        fn drop(&mut self) {
-            if self.0 { let _ = disable_raw_mode(); }
+    fn launch(exe: &Path, path: &str, tx: &Sender<String>) -> Result<Child, String> {
+        let mut child = Command::new(exe).args(["run", path])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+            .map_err(|e| format!("cannot start application: {e}"))?;
+        for stream in [child.stdout.take(), child.stderr.take()] {
+            if let Some(stream) = stream {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    for line in BufReader::new(stream).lines() {
+                        match line {
+                            Ok(line) => { if tx.send(line).is_err() { break; } }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
         }
+        Ok(child)
     }
-    fn spawn(executable: &Path, path: &str) -> Result<Child, String> {
-        Command::new(executable).args(["run", path]).spawn()
-            .map_err(|e| format!("cannot start RUX application: {e}"))
+    fn valid(exe: &Path, path: &str) -> bool {
+        Command::new(exe).args(["check", path]).output()
+            .is_ok_and(|output| output.status.success())
     }
-    fn check(executable: &Path, path: &str) -> bool {
-        Command::new(executable).args(["check", path]).status()
-            .is_ok_and(|status| status.success())
-    }
-    fn restart(child: &mut Child, executable: &Path, path: &str) -> Result<(), String> {
-        if !check(executable, path) {
-            eprintln!("RUX dev: validation failed; keeping previous application running");
-            return Ok(());
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        *child = spawn(executable, path)?;
-        println!("RUX dev: application restarted");
-        Ok(())
-    }
-
-    let executable = env::current_exe().map_err(|e| format!("cannot locate RUX executable: {e}"))?;
-    let mut last_source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    if !check(&executable, path) {
-        return Err("Fix the RUX source errors before starting dev mode".into());
-    }
-    let mut child = spawn(&executable, path)?;
-    let interactive = enable_raw_mode().is_ok();
-    let _terminal = TerminalGuard(interactive);
-    println!("\\r\\n  RUX {}  |  DEVELOPMENT", env!("CARGO_PKG_VERSION"));
-    println!("  Source: {path}");
-    dev_log(interactive, "INFO", "Watching for changes...");
-    dev_footer(interactive);
-
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    let mut source = fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if !valid(&exe, path) { return Err("Fix source errors before starting dev mode".into()); }
+    let (tx, rx) = mpsc::channel::<String>();
+    let mut child = launch(&exe, path, &tx)?;
+    let mut console = dev_console::DevConsole::new(path);
+    console.status = "RUNNING".into();
+    console.log("INFO", "Application started. Watching for changes.");
     let mut exit_reported = false;
-    loop {
-        if interactive && event::poll(Duration::from_millis(100)).unwrap_or(false) {
+    let mut quit = false;
+    while !quit {
+        if console.active && event::poll(Duration::from_millis(100)).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char('q' | 'Q') => break,
+                        KeyCode::Char('q' | 'Q') => quit = true,
                         KeyCode::Char('r' | 'R') => {
-                            restart(&mut child, &executable, path)?;
-                            exit_reported = false;
+                            if valid(&exe, path) {
+                                let _ = child.kill(); let _ = child.wait();
+                                child = launch(&exe, path, &tx)?;
+                                console.status = "RUNNING".into();
+                                console.log("SUCCESS", "Application restarted");
+                                exit_reported = false;
+                            } else { console.log("ERROR", "Validation failed; keeping current application"); }
                         }
                         KeyCode::Char('t' | 'T') => {
-                            dev_log(interactive, "INFO", "Running tests...");
-                            let status = Command::new("cargo").args(["test", "--all-targets"]).status();
-                            let passed = matches!(status, Ok(s) if s.success());
-                            dev_log(interactive, if passed { "SUCCESS" } else { "ERROR" }, if passed { "Tests passed" } else { "Tests failed" });
+                            console.log("INFO", "Running tests...");
+                            let result = Command::new("cargo").args(["test", "--all-targets"]).output();
+                            match result {
+                                Ok(output) => {
+                                    for line in String::from_utf8_lossy(&output.stdout).lines().chain(String::from_utf8_lossy(&output.stderr).lines()) {
+                                        console.log("INFO", line);
+                                    }
+                                    console.log(if output.status.success() { "SUCCESS" } else { "ERROR" },
+                                        if output.status.success() { "Tests passed" } else { "Tests failed" });
+                                }
+                                Err(error) => console.log("ERROR", &format!("Cannot run tests: {error}")),
+                            }
                         }
-                        KeyCode::Char('s' | 'S') => {
-                            let status = child.try_wait().ok().flatten();
-                            dev_log(interactive, "INFO", &format!("{} | source: {path}", if status.is_some() { "STOPPED" } else { "RUNNING" }));
-                        }
-                        KeyCode::Char('h' | 'H') => dev_log(interactive, "INFO", "R Restart | T Run tests | S Show status | H Help | Q Quit"),
+                        KeyCode::Char('s' | 'S') => console.log("INFO", &format!("Status: {} | source: {path}", console.status)),
+                        KeyCode::Char('h' | 'H') => console.log("INFO", "R Restart | T Tests | S Status | H Help | Q Quit | Up/Down Scroll"),
+                        KeyCode::Up => console.scroll_up(),
+                        KeyCode::Down => console.scroll_down(),
                         _ => {}
                     }
                 }
             }
-        } else {
-            thread::sleep(Duration::from_millis(100));
+        } else { thread::sleep(Duration::from_millis(100)); }
+        while let Ok(line) = rx.try_recv() {
+            let level = if line.contains("ERROR") || line.starts_with("error") { "ERROR" }
+                else if line.contains("WARN") { "WARN" }
+                else if line.contains("DEBUG") { "DEBUG" }
+                else { "INFO" };
+            console.log(level, &line);
         }
         match fs::read(path) {
-            Ok(source) if source != last_source => {
-                last_source = source;
-                thread::sleep(Duration::from_millis(200));
-                dev_log(interactive, "DEBUG", "Source changed");
-                restart(&mut child, &executable, path)?;
-                exit_reported = false;
+            Ok(next) if next != source => {
+                source = next;
+                if valid(&exe, path) {
+                    let _ = child.kill(); let _ = child.wait();
+                    child = launch(&exe, path, &tx)?;
+                    console.status = "RUNNING".into();
+                    console.log("SUCCESS", "Source changed; application restarted");
+                    exit_reported = false;
+                } else { console.log("ERROR", "Source validation failed; previous application retained"); }
             }
-            Ok(_) => {}
-            Err(error) => eprintln!("RUX dev: cannot read {path}: {error}"),
+            _ => {}
         }
         if !exit_reported {
             if let Ok(Some(status)) = child.try_wait() {
-                dev_log(interactive, "WARN", &format!("Application exited ({status}); waiting for changes or [R]"));
+                console.status = "STOPPED".into();
+                console.log("WARN", &format!("Application exited: {status}"));
                 exit_reported = true;
             }
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    dev_log(interactive, "INFO", "Development server stopped");
     Ok(())
 }
 
