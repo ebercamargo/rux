@@ -76,18 +76,27 @@ fn dev(path: &str) -> Result<(), String> {
         let mut child = Command::new(exe).args(["run", path])
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             .map_err(|e| format!("cannot start application: {e}"))?;
-        for stream in [child.stdout.take(), child.stderr.take()] {
-            if let Some(stream) = stream {
-                let tx = tx.clone();
-                thread::spawn(move || {
-                    for line in BufReader::new(stream).lines() {
-                        match line {
-                            Ok(line) => { if tx.send(line).is_err() { break; } }
-                            Err(_) => break,
-                        }
+        if let Some(stdout) = child.stdout.take() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) => { if tx.send(line).is_err() { break; } }
+                        Err(_) => break,
                     }
-                });
-            }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    match line {
+                        Ok(line) => { if tx.send(line).is_err() { break; } }
+                        Err(_) => break,
+                    }
+                }
+            });
         }
         Ok(child)
     }
