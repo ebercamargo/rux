@@ -295,7 +295,7 @@ fn main() {
 mod tests {
     use super::*;
     #[test]
-    fn generated_api_secret_uses_256_bit_uuid_material() {
+    fn generated_api_secret_is_64_hex_chars() {
         let secret = generate_api_secret();
         assert_eq!(secret.len(), 64);
         assert!(secret.chars().all(|character| character.is_ascii_hexdigit()));
