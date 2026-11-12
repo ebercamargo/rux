@@ -128,11 +128,11 @@ function validateDatePattern(value,pattern){
  const re=/yyyy|yy|MM|dd|HH|hh|mm|ss|M|d|H|h|m|s|S{1,9}/g;
  let expression="^",cursor=0;
  for(const match of pattern.matchAll(re)){
-  expression+=pattern.slice(cursor,match.index).replace(/[.*+?^${}()|[\]\\]/g,"\\function isoDate(value)");
+  expression+=pattern.slice(cursor,match.index).replace(/[-/. :T,_]/g,ch=>"\\"+ch);
   const token=match[0],size=token==="yyyy"?4:token.length===1?2:token.length;
   expression+="(\\d{"+size+"})";cursor=match.index+token.length;
  }
- expression+=pattern.slice(cursor).replace(/[.*+?^${}()|[\]\\]/g,"\\function isoDate(value)")+"$";
+ expression+=pattern.slice(cursor).replace(/[-/. :T,_]/g,ch=>"\\"+ch)+"$";
  return new RegExp(expression).test(value);
 }
 function isoDate(value){const match=/^(\d{2})\/(\d{2})\/(\d{4})$/.exec(String(value));return match?match[3]+"-"+match[2]+"-"+match[1]:String(value||"");}
