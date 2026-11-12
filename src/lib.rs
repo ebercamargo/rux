@@ -18,3 +18,5 @@ pub fn run(source: &str) -> Result<String, String> {
     let program = parser::parse(&tokens)?;
     runtime::run(&program)
 }
+
+pub mod project;
