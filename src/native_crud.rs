@@ -24,6 +24,17 @@ struct AppState {
     request_duration_micros: Arc<AtomicU64>,
 }
 
+fn valid_mask(value: &str, pattern: &str) -> bool {
+    let mut chars = value.chars();
+    for symbol in pattern.chars() {
+        let Some(actual) = chars.next() else { return false; };
+        if symbol == '9' {
+            if !actual.is_ascii_digit() { return false; }
+        } else if actual != symbol { return false; }
+    }
+    chars.next().is_none()
+}
+
 fn valid_datetime(value: &str, pattern: &str) -> bool {
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     let chrono_pattern = match pattern {
@@ -57,7 +68,9 @@ fn validate(input: &Value, fields: &[(String, String)]) -> Result<Map<String, Va
         let value = object.get(name).and_then(Value::as_str).ok_or(StatusCode::BAD_REQUEST)?;
         let value = value.trim();
         if value.is_empty() || value.len() > 250 { return Err(StatusCode::BAD_REQUEST); }
-        let valid = if let Some(pattern) = kind.strip_prefix("DateTime|") {
+        let valid = if let Some(pattern) = kind.strip_prefix("Text|") {
+            valid_mask(value, pattern)
+        } else if let Some(pattern) = kind.strip_prefix("DateTime|") {
             valid_datetime(value, pattern)
         } else { match kind.as_str() {
             "Email" => {
