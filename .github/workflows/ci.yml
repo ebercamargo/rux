@@ -155,3 +155,52 @@ jobs:
           grep -q '"telefone"' CiRefresh/index.html
           curl -fsS 'http://127.0.0.1:3000/api/records?q=Alice' > ci-persisted.json
           node -e 'if(require("./ci-persisted.json").length!==1)process.exit(1)'
+
+      - name: Identity authorization and immediate revocation smoke test
+        run: |
+          set -euo pipefail
+          cat > ci_identity.rux <<'RUX'
+          app CiIdentity {
+              data Customer {
+                  name: Text
+              }
+          }
+          RUX
+          PORT=3200 cargo run --quiet -- run ci_identity.rux > ci-identity-seed.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3200/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3200/health/ready >/dev/null
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+          umask 077
+          cargo run --quiet -- identity create CiIdentity ci_reader reader > reader-secret.txt
+          cargo run --quiet -- identity create CiIdentity ci_editor editor > editor-secret.txt
+          cargo run --quiet -- identity create CiIdentity ci_admin admin > admin-secret.txt
+          reader=$(sed -n 's/^API token (displayed once; store securely): //p' reader-secret.txt)
+          editor=$(sed -n 's/^API token (displayed once; store securely): //p' editor-secret.txt)
+          admin=$(sed -n 's/^API token (displayed once; store securely): //p' admin-secret.txt)
+          test "${#reader}" = "68"
+          test "${#editor}" = "68"
+          test "${#admin}" = "68"
+          RUX_AUTH_MODE=identities PORT=3200 cargo run --quiet -- run ci_identity.rux > ci-identity-runtime.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; rm -f reader-secret.txt editor-secret.txt admin-secret.txt' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3200/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3200/health/ready >/dev/null
+          url=http://127.0.0.1:3200/api/records
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$url")" = "401"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $reader" "$url")" = "200"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $reader" -H 'Content-Type: application/json' -d '{"name":"Ana"}' "$url")" = "403"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $editor" -H 'Content-Type: application/json' -d '{"name":"Ana"}' "$url")" = "201"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $editor" "$url/placeholder")" = "403"
+          cargo run --quiet -- identity revoke CiIdentity ci_reader >/dev/null
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $reader" "$url")" = "401"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $admin" "$url")" = "200"
