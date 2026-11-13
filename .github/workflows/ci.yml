@@ -311,3 +311,87 @@ jobs:
           done
           curl -fsS "$url/api/records" > ci-owned-legacy-list.json
           python3 -c 'import json; assert json.load(open("ci-owned-legacy-list.json"))==[]'
+
+      - name: Native tenant isolation across users and roles
+        run: |
+          set -euo pipefail
+          cat > ci_tenancy.rux <<'RUX'
+          app CiTenancy {
+              data Customer {
+                  name: Text
+              }
+          }
+          RUX
+          PORT=3500 cargo run --quiet -- run ci_tenancy.rux > ci-tenant-init.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3500/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3500/health/ready >/dev/null
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+          umask 077
+          printf '%s\n' 'test-only-long-password-123' | cargo run --quiet -- user create CiTenancy alice_global_admin admin --password-stdin
+          printf '%s\n' 'test-only-long-password-123' | cargo run --quiet -- user create CiTenancy bob_editor editor --password-stdin
+          printf '%s\n' 'test-only-long-password-123' | cargo run --quiet -- user create CiTenancy acme_admin reader --password-stdin
+          cargo run --quiet -- tenant create CiTenancy acme 'Acme Company'
+          cargo run --quiet -- tenant create CiTenancy other 'Other Company'
+          cargo run --quiet -- tenant grant CiTenancy acme alice_global_admin editor
+          cargo run --quiet -- tenant grant CiTenancy other alice_global_admin reader
+          cargo run --quiet -- tenant grant CiTenancy other bob_editor admin
+          cargo run --quiet -- tenant grant CiTenancy acme acme_admin admin
+          RUX_AUTH_MODE=users RUX_TENANCY=enabled PORT=3500 cargo run --quiet -- run ci_tenancy.rux > ci-tenant-server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; rm -f ci-tenant-*.json ci-tenant-*.cookies' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3500/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          url=http://127.0.0.1:3500
+          for user in alice_global_admin bob_editor acme_admin; do
+            curl -fsS -c "ci-tenant-$user.cookies" -H 'Content-Type: application/json' \
+              -d "{\"username\":\"$user\",\"password\":\"test-only-long-password-123\"}" \
+              "$url/auth/login" > "ci-tenant-$user.json"
+          done
+          curl -fsS -b ci-tenant-alice_global_admin.cookies "$url/auth/tenants" > ci-tenant-memberships.json
+          python3 -c 'import json; data=json.load(open("ci-tenant-memberships.json")); assert data["enabled"]; roles={t["slug"]:t["role"] for t in data["tenants"]}; assert roles=={"acme":"editor","other":"reader"}'
+          acme=$(python3 -c 'import json; data=json.load(open("ci-tenant-memberships.json")); print(next(t["id"] for t in data["tenants"] if t["slug"]=="acme"))')
+          other=$(python3 -c 'import json; data=json.load(open("ci-tenant-memberships.json")); print(next(t["id"] for t in data["tenants"] if t["slug"]=="other"))')
+          alicecsrf=$(python3 -c 'import json; print(json.load(open("ci-tenant-alice_global_admin.json"))["csrf"])')
+          bobcsrf=$(python3 -c 'import json; print(json.load(open("ci-tenant-bob_editor.json"))["csrf"])')
+          admincsrf=$(python3 -c 'import json; print(json.load(open("ci-tenant-acme_admin.json"))["csrf"])')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-tenant-alice_global_admin.cookies "$url/api/records")" = "400"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-tenant-bob_editor.cookies -H "X-RUX-TENANT: $acme" "$url/api/records")" = "403"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-tenant-alice_global_admin.cookies -H "X-RUX-TENANT: $other" -H "X-RUX-CSRF: $alicecsrf" \
+            -H 'Content-Type: application/json' -d '{"name":"not allowed"}' "$url/api/records")" = "403"
+          curl -fsS -b ci-tenant-alice_global_admin.cookies -H "X-RUX-TENANT: $acme" -H "X-RUX-CSRF: $alicecsrf" \
+            -H 'Content-Type: application/json' -d '{"name":"Acme data"}' "$url/api/records" > ci-tenant-created-acme.json
+          curl -fsS -b ci-tenant-bob_editor.cookies -H "X-RUX-TENANT: $other" -H "X-RUX-CSRF: $bobcsrf" \
+            -H 'Content-Type: application/json' -d '{"name":"Other data"}' "$url/api/records" > ci-tenant-created-other.json
+          curl -fsS -b ci-tenant-alice_global_admin.cookies -H "X-RUX-TENANT: $acme" "$url/api/records" > ci-tenant-list-acme.json
+          curl -fsS -b ci-tenant-alice_global_admin.cookies -H "X-RUX-TENANT: $other" "$url/api/records" > ci-tenant-list-other.json
+          python3 -c 'import json; assert [r["name"] for r in json.load(open("ci-tenant-list-acme.json"))]==["Acme data"]; assert [r["name"] for r in json.load(open("ci-tenant-list-other.json"))]==["Other data"]'
+          other_id=$(python3 -c 'import json; print(json.load(open("ci-tenant-created-other.json"))["id"])')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -b ci-tenant-acme_admin.cookies \
+            -H "X-RUX-TENANT: $acme" -H "X-RUX-CSRF: $admincsrf" -H 'Content-Type: application/json' \
+            -d '{"name":"stolen"}' "$url/api/records/$other_id")" = "404"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -b ci-tenant-acme_admin.cookies \
+            -H "X-RUX-TENANT: $acme" -H "X-RUX-CSRF: $admincsrf" "$url/api/records/$other_id")" = "404"
+          cargo run --quiet -- tenant revoke CiTenancy other bob_editor
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-tenant-bob_editor.cookies \
+            -H "X-RUX-TENANT: $other" "$url/api/records")" = "403"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+          PORT=3500 cargo run --quiet -- run ci_tenancy.rux > ci-tenant-legacy.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3500/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS "$url/api/records" > ci-tenant-legacy-visible.json
+          python3 -c 'import json; assert json.load(open("ci-tenant-legacy-visible.json"))==[]'
