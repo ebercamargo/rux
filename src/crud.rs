@@ -83,9 +83,10 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 </style>
 </head>
 <body><main>
-<header><h1>CRUD __RUX_TITLE__</h1><p>RUX • Cadastro multiplataforma no navegador</p></header>
-<section><h2 id="form-title">Novo registro</h2><form id="record-form"></form><p id="status" role="status" aria-live="polite"></p></section>
-<section><div class="toolbar"><h2>Registros</h2><input id="search" type="search" placeholder="Pesquisar..." aria-label="Pesquisar registros"></div>
+<header class="toolbar"><div><h1>CRUD __RUX_TITLE__</h1><p>RUX • Cadastro multiplataforma no navegador</p></div><div><span id="logged-user"></span> <button id="logout" class="secondary" type="button" hidden>Sair</button></div></header>
+<section id="auth-section" hidden><h2>Login</h2><form id="auth-form"><label>Usuário<input name="username" autocomplete="username" required maxlength="64"></label><label>Senha<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Entrar</button></form><p id="auth-status" role="status" aria-live="polite"></p></section>
+<section id="crud-section"><h2 id="form-title">Novo registro</h2><form id="record-form"></form><p id="status" role="status" aria-live="polite"></p></section>
+<section id="records-section"><div class="toolbar"><h2>Registros</h2><input id="search" type="search" placeholder="Pesquisar..." aria-label="Pesquisar registros"></div>
 <div class="table-scroll"><table><thead id="table-head"></thead><tbody id="table-body"></tbody></table></div><div class="pager"><button id="previous" type="button" class="secondary">Anterior</button><span id="page-label">Página 1</span><button id="next" type="button" class="secondary">Próxima</button></div></section>
 </main>
 <script>
@@ -142,6 +143,52 @@ const body=document.getElementById("table-body");
 const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
+let csrfToken=null,sessionMode=false,currentRole=null;
+const authSection=document.getElementById("auth-section");
+const authStatus=document.getElementById("auth-status");
+const authForm=document.getElementById("auth-form");
+const logoutButton=document.getElementById("logout");
+const crudSection=document.getElementById("crud-section");
+const recordsSection=document.getElementById("records-section");
+function showLogin(){
+ sessionMode=true;csrfToken=null;currentRole=null;records=[];render();
+ authSection.hidden=false;crudSection.hidden=true;recordsSection.hidden=true;logoutButton.hidden=true;
+ document.getElementById("logged-user").textContent="";
+}
+function showAuthenticated(user){
+ sessionMode=true;csrfToken=user.csrf;currentRole=user.role;
+ authSection.hidden=true;crudSection.hidden=user.role==="reader";recordsSection.hidden=false;
+ logoutButton.hidden=false;
+ document.getElementById("logged-user").textContent=user.username+" ("+user.role+")";
+ render();
+}
+async function initSession(){
+ if(!remote){load();return;}
+ try{
+  const response=await fetch("/auth/session",{credentials:"same-origin",cache:"no-store"});
+  if(response.status===404){load();return;}
+  if(response.status===401){showLogin();return;}
+  if(!response.ok)throw Error("HTTP "+response.status);
+  showAuthenticated(await response.json());load();
+ }catch(e){showLogin();authStatus.textContent="Não foi possível verificar a sessão: "+e.message;}
+}
+authForm.addEventListener("submit",async event=>{
+ event.preventDefault();authStatus.textContent="";
+ const username=authForm.elements.namedItem("username").value.trim();
+ const password=authForm.elements.namedItem("password").value;
+ try{
+  const response=await fetch("/auth/login",{method:"POST",credentials:"same-origin",
+   headers:{"Content-Type":"application/json"},body:JSON.stringify({username,password})});
+  if(response.status===401){authStatus.textContent="Usuário ou senha inválidos, ou acesso temporariamente bloqueado.";return;}
+  if(!response.ok)throw Error("HTTP "+response.status);
+  const user=await response.json();
+  authForm.reset();showAuthenticated(user);resetPages();
+ }catch(e){authStatus.textContent="Falha no login: "+e.message;}
+});
+logoutButton.addEventListener("click",async()=>{
+ try{await request("POST","/auth/logout",{});}catch(e){status.textContent="Não foi possível sair: "+e.message;return;}
+ editing=null;showLogin();authStatus.textContent="Sessão encerrada.";
+});
 let records=[];
 let cursors=[null],pageIndex=0,hasMore=false,searchTimer=null,loadVersion=0;
 const pageSize=50;
@@ -150,8 +197,15 @@ try{const stored=JSON.parse(localStorage.getItem(key)||"[]");if(Array.isArray(st
 catch(e){status.textContent="Não foi possível ler os dados locais.";}
 function persist(){try{localStorage.setItem(key,JSON.stringify(records));return true;}catch(e){status.textContent="Erro ao salvar no armazenamento local.";return false;}}
 async function request(method,url,payload){
- const response=await fetch(url,{method,headers:{"Content-Type":"application/json"},body:payload===undefined?undefined:JSON.stringify(payload)});
- if(!response.ok)throw Error("HTTP "+response.status);
+ const headers={"Content-Type":"application/json"};
+ if(csrfToken&&method!=="GET"&&method!=="HEAD")headers["X-RUX-CSRF"]=csrfToken;
+ const response=await fetch(url,{method,headers,credentials:"same-origin",cache:"no-store",
+  body:payload===undefined?undefined:JSON.stringify(payload)});
+ if(!response.ok){
+  if(response.status===401&&sessionMode){showLogin();throw Error("Sessão expirada. Entre novamente.");}
+  if(response.status===403)throw Error("Permissão insuficiente ou validação de segurança recusada.");
+  throw Error("HTTP "+response.status);
+ }
  return response.json();
 }
 async function load(){
@@ -243,14 +297,16 @@ function render(){
   const row=element("tr");for(const f of fields)row.append(element("td",String(record[f]||"")));
   const cell=element("td"),actions=element("div");actions.className="actions";
   const edit=element("button","Editar");edit.type="button";edit.className="secondary";
+  if(sessionMode&&currentRole==="reader")edit.hidden=true;
   edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=fieldTypes[f]==="Date"?isoDate(record[f]):record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
   const remove=element("button","Excluir");remove.type="button";remove.className="danger";
+  if(sessionMode&&currentRole!=="admin")remove.hidden=true;
   remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";resetPages();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
   actions.append(edit,remove);cell.append(actions);row.append(cell);body.append(row);
  }
 }
 document.getElementById("search").addEventListener("input",()=>{if(!remote){render();return;}clearTimeout(searchTimer);searchTimer=setTimeout(resetPages,250);});
-render();load();
+render();initSession();
 </script></body></html>"##;
 
 #[cfg(test)]
