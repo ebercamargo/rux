@@ -12,6 +12,7 @@ const LOCK_SECONDS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
+    pub user_id: String,
     pub username: String,
     pub role: String,
     pub expires_at: i64,
@@ -135,7 +136,7 @@ pub fn login(db: &Connection, username: &str, password: &str, now: i64) -> Resul
         params![digest(&token),user_id,now,expires_at],
     ).map_err(|e| e.to_string())?;
     Ok(Some(Login {
-        session: Session { username: username.into(), role, expires_at, csrf: csrf_for(&token) },
+        session: Session { user_id, username: username.into(), role, expires_at, csrf: csrf_for(&token) },
         token,
     }))
 }
@@ -144,13 +145,13 @@ pub fn session(db: &Connection, token: &str, now: i64) -> Result<Option<Session>
     if !token.starts_with("ruxs_") || token.len() != 69 || !token[5..].bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(None);
     }
-    let user: Option<(String,String,i64)> = db.query_row(
-        "SELECT u.username,u.role,s.expires_at FROM rux_sessions s JOIN rux_users u ON u.id = s.user_id
+    let user: Option<(String,String,String,i64)> = db.query_row(
+        "SELECT u.id,u.username,u.role,s.expires_at FROM rux_sessions s JOIN rux_users u ON u.id = s.user_id
          WHERE s.token_hash = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2 AND u.disabled = 0",
-        params![digest(token),now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        params![digest(token),now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
     ).optional().map_err(|e| e.to_string())?;
-    Ok(user.map(|(username,role,expires_at)| Session {
-        username, role, expires_at, csrf: csrf_for(token),
+    Ok(user.map(|(user_id,username,role,expires_at)| Session {
+        user_id, username, role, expires_at, csrf: csrf_for(token),
     }))
 }
 
@@ -227,6 +228,8 @@ mod tests {
         let active = session(&db,&auth.token,1000).unwrap().unwrap();
         assert_eq!(active.username,"alice");
         assert_eq!(active.role,"reader");
+        assert_eq!(active.user_id,auth.session.user_id);
+        assert!(!active.user_id.is_empty());
         assert!(can(&active.role,"GET"));
         assert!(!can(&active.role,"POST"));
         assert!(!can(&active.role,"DELETE"));
