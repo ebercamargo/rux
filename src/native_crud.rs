@@ -365,7 +365,6 @@ async fn check_identity(state: &AppState, authorization: Option<&str>, operation
 #[derive(Clone, Debug)]
 struct TenantContext {
     id: String,
-    role: String,
 }
 
 async fn verified_tenant(state: &AppState, user_id: &str, id: &str)
@@ -451,9 +450,7 @@ async fn limit_api(State(state): State<AppState>, mut request: Request, next: Ne
                     if !super::user_auth::can(&membership.role, &operation) {
                         return Err(StatusCode::FORBIDDEN);
                     }
-                    request.extensions_mut().insert(TenantContext {
-                        id: membership.id, role: membership.role,
-                    });
+                    request.extensions_mut().insert(TenantContext { id: membership.id });
                 }
                 request.extensions_mut().insert(principal);
             },
@@ -552,28 +549,42 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
 
 #[derive(Clone, Debug)]
 struct RecordAccess {
-    /// 0 = old/local API records only; 1 = own records; 2 = administrator.
+    /// 0 = old/local API rows; 1 = personal rows; 2 = local administrator; 3 = active tenant.
     scope: i64,
     owner_id: Option<String>,
+    tenant_id: Option<String>,
 }
 
-fn record_access(auth_mode: AuthMode, principal: Option<Extension<super::user_auth::Session>>)
+fn record_access(auth_mode: AuthMode, principal: Option<Extension<super::user_auth::Session>>,
+    tenant: Option<Extension<TenantContext>>, tenancy_enabled: bool)
     -> Result<RecordAccess, StatusCode>
 {
     match auth_mode {
-        AuthMode::Legacy | AuthMode::Identities => Ok(RecordAccess { scope: 0, owner_id: None }),
+        AuthMode::Legacy | AuthMode::Identities => Ok(RecordAccess {
+            scope: 0, owner_id: None, tenant_id: None,
+        }),
         AuthMode::Users => {
             let user = principal.ok_or(StatusCode::UNAUTHORIZED)?.0;
+            if tenancy_enabled {
+                let tenant_id = tenant.ok_or(StatusCode::FORBIDDEN)?.0.id;
+                return Ok(RecordAccess {
+                    scope: 3, owner_id: Some(user.user_id), tenant_id: Some(tenant_id),
+                });
+            }
             let scope = if user.role == "admin" { 2 } else { 1 };
-            Ok(RecordAccess { scope, owner_id: Some(user.user_id) })
+            Ok(RecordAccess {
+                scope, owner_id: Some(user.user_id), tenant_id: None,
+            })
         }
     }
 }
 
 const LIST_SQL: &str = "SELECT rowid, id, payload FROM records
              WHERE rowid < ?1
-               AND (?5 = 2 OR (?5 = 0 AND owner_user_id IS NULL)
-                   OR (?5 = 1 AND owner_user_id = ?6))
+               AND ((?5 = 2 AND tenant_id IS NULL)
+                   OR (?5 = 0 AND tenant_id IS NULL AND owner_user_id IS NULL)
+                   OR (?5 = 1 AND tenant_id IS NULL AND owner_user_id = ?6)
+                   OR (?5 = 3 AND tenant_id = ?7))
                AND (?3 = '' OR EXISTS (
                  SELECT 1 FROM json_each(payload)
                  WHERE (?4 = '' OR json_each.key = ?4)
@@ -590,8 +601,9 @@ struct Page {
 }
 
 async fn list(State(state): State<AppState>, Query(page): Query<Page>,
-    principal: Option<Extension<super::user_auth::Session>>) -> Result<Json<Value>, StatusCode> {
-    let access = record_access(state.auth_mode, principal)?;
+    principal: Option<Extension<super::user_auth::Session>>,
+    tenant: Option<Extension<TenantContext>>) -> Result<Json<Value>, StatusCode> {
+    let access = record_access(state.auth_mode, principal, tenant, state.tenancy_enabled)?;
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
     let query = page.q.unwrap_or_default();
@@ -605,7 +617,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>,
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let mut stmt = db.prepare(LIST_SQL)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt.query_map(params![before, limit, query, field, access.scope, access.owner_id], |row| {
+        let rows = stmt.query_map(params![before, limit, query, field, access.scope, access.owner_id, access.tenant_id], |row| {
             let cursor: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             let payload: String = row.get(2)?;
@@ -624,15 +636,16 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>,
 }
 
 async fn create(State(state): State<AppState>, principal: Option<Extension<super::user_auth::Session>>,
+    tenant: Option<Extension<TenantContext>>,
     Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
-    let access = record_access(state.auth_mode, principal)?;
+    let access = record_access(state.auth_mode, principal, tenant, state.tenancy_enabled)?;
     let mut payload = Value::Object(validate(&input, &state.fields)?);
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let id = uuid::Uuid::new_v4().to_string();
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        db.execute("INSERT INTO records (id, payload, owner_user_id) VALUES (?1, ?2, ?3)",
-            params![id, payload.to_string(), access.owner_id])
+        db.execute("INSERT INTO records (id, payload, owner_user_id, tenant_id) VALUES (?1, ?2, ?3, ?4)",
+            params![id, payload.to_string(), access.owner_id, access.tenant_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         payload["id"] = json!(id);
         Ok((StatusCode::CREATED, Json(payload)))
@@ -641,16 +654,19 @@ async fn create(State(state): State<AppState>, principal: Option<Extension<super
 
 async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
     principal: Option<Extension<super::user_auth::Session>>,
+    tenant: Option<Extension<TenantContext>>,
     Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
-    let access = record_access(state.auth_mode, principal)?;
+    let access = record_access(state.auth_mode, principal, tenant, state.tenancy_enabled)?;
     let mut payload = Value::Object(validate(&input, &state.fields)?);
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2
-                AND (?3 = 2 OR (?3 = 0 AND owner_user_id IS NULL)
-                    OR (?3 = 1 AND owner_user_id = ?4))",
-                params![payload.to_string(), id, access.scope, access.owner_id])
+                AND ((?3 = 2 AND tenant_id IS NULL)
+                    OR (?3 = 0 AND tenant_id IS NULL AND owner_user_id IS NULL)
+                    OR (?3 = 1 AND tenant_id IS NULL AND owner_user_id = ?4)
+                    OR (?3 = 3 AND tenant_id = ?5))",
+                params![payload.to_string(), id, access.scope, access.owner_id, access.tenant_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if count == 0 { return Err(StatusCode::NOT_FOUND); }
         payload["id"] = json!(id);
@@ -659,15 +675,18 @@ async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
 }
 
 async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
-    principal: Option<Extension<super::user_auth::Session>>) -> Result<impl IntoResponse, StatusCode> {
-    let access = record_access(state.auth_mode, principal)?;
+    principal: Option<Extension<super::user_auth::Session>>,
+    tenant: Option<Extension<TenantContext>>) -> Result<impl IntoResponse, StatusCode> {
+    let access = record_access(state.auth_mode, principal, tenant, state.tenancy_enabled)?;
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let count = db.execute("DELETE FROM records WHERE id = ?1
-                AND (?2 = 2 OR (?2 = 0 AND owner_user_id IS NULL)
-                    OR (?2 = 1 AND owner_user_id = ?3))",
-                params![id, access.scope, access.owner_id])
+                AND ((?2 = 2 AND tenant_id IS NULL)
+                    OR (?2 = 0 AND tenant_id IS NULL AND owner_user_id IS NULL)
+                    OR (?2 = 1 AND tenant_id IS NULL AND owner_user_id = ?3)
+                    OR (?2 = 3 AND tenant_id = ?4))",
+                params![id, access.scope, access.owner_id, access.tenant_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if count == 0 { return Err(StatusCode::NOT_FOUND); }
         Ok(Json(json!({"deleted": true})))
@@ -700,7 +719,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     {
         let connection = db.get().map_err(|e| e.to_string())?;
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (
-            id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT);")
+            id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT, tenant_id TEXT);")
             .map_err(|e| e.to_string())?;
         let has_owner_column: i64 = connection.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'owner_user_id'",
@@ -710,6 +729,16 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             connection.execute_batch("ALTER TABLE records ADD COLUMN owner_user_id TEXT")
                 .map_err(|e| format!("Cannot migrate records ownership column: {e}"))?;
         }
+        let has_tenant_column: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'tenant_id'",
+            [], |row| row.get(0)
+        ).map_err(|e| e.to_string())?;
+        if has_tenant_column == 0 {
+            connection.execute_batch("ALTER TABLE records ADD COLUMN tenant_id TEXT")
+                .map_err(|e| format!("Cannot migrate tenant_id ownership column: {e}"))?;
+        }
+        connection.execute_batch("CREATE INDEX IF NOT EXISTS records_tenant_idx ON records (tenant_id)")
+            .map_err(|e| e.to_string())?;
         connection.execute_batch("CREATE INDEX IF NOT EXISTS records_owner_idx ON records (owner_user_id)")
             .map_err(|e| e.to_string())?;
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
