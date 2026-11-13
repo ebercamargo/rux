@@ -1,6 +1,7 @@
 //! Browser-user authentication for the experimental RUX native CRUD.
 //! Local administrator provisioning only; no HTTP self-registration.
-use argon2::{password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng}, Argon2};
+use argon2::{password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}, Argon2};
+use rand_core::OsRng;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::{SystemTime, UNIX_EPOCH}};
@@ -190,9 +191,9 @@ pub fn disable(db: &Connection, username: &str) -> Result<bool, String> {
 pub fn list(db: &Connection) -> Result<Vec<(String,String,bool)>, String> {
     initialize(db).map_err(|e| e.to_string())?;
     let mut stmt = db.prepare("SELECT username,role,disabled FROM rux_users ORDER BY username").map_err(|e| e.to_string())?;
-    stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get::<_,i64>(2)? != 0)))
-        .map_err(|e| e.to_string())?
-        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get::<_,i64>(2)? != 0)))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
 }
 
 fn project_db(project: &Path) -> Result<Connection, String> {
