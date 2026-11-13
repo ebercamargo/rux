@@ -260,7 +260,7 @@ fn project_check(path: &str) {
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity, user, tenant");
     println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
@@ -272,6 +272,10 @@ fn help() {
     println!("  user create <project> <name> <role> --password-stdin  Read password from stdin");
     println!("  user list <project>                            List login users");
     println!("  user disable <project> <name>                  Disable login user and sessions");
+    println!("  tenant create <project> <slug> <name>          Create tenant (quote names with spaces)");
+    println!("  tenant grant <project> <slug> <user> <role>    Set tenant-specific reader/editor/admin role");
+    println!("  tenant revoke <project> <slug> <user>          Revoke membership");
+    println!("  tenant list <project>                          List tenants");
     println!("  --version        Print version");
     println!("  --help           Show this help");
 }
@@ -346,6 +350,33 @@ fn main() {
                     println!("{username} | {role} | {}", if disabled { "DISABLED" } else { "ACTIVE" });
                 },
                 Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, slug, name] if operation == "tenant" && subcommand == "create" => {
+            match rux::tenant::create_in_project(Path::new(project), slug, name) {
+                Ok(id) => println!("Tenant created: {slug} ({id})"),
+                Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, slug, username, role] if operation == "tenant" && subcommand == "grant" => {
+            match rux::tenant::grant_in_project(Path::new(project), slug, username, role) {
+                Ok(()) => println!("Tenant role granted: {username} | {slug} | {role}"),
+                Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, slug, username] if operation == "tenant" && subcommand == "revoke" => {
+            match rux::tenant::revoke_in_project(Path::new(project), slug, username) {
+                Ok(true) => println!("Tenant membership revoked: {username} | {slug}"),
+                Ok(false) => { eprintln!("RUX tenant error: membership not found or already revoked"); process::exit(1); }
+                Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project] if operation == "tenant" && subcommand == "list" => {
+            match rux::tenant::list_in_project(Path::new(project)) {
+                Ok(tenants) => for (slug, name, active) in tenants {
+                    println!("{slug} | {name} | {}", if active { "ACTIVE" } else { "DISABLED" });
+                },
+                Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
             }
         }
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
