@@ -677,6 +677,10 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             return Err("RUX_AUTH_MODE=identities requires at least one active identity. Run: rux identity create <app-directory> <name> admin".into());
         }
     }
+    if auth_mode == AuthMode::Users && !address.ip().is_loopback()
+        && std::env::var("RUX_TLS_TERMINATED_AT_PROXY").as_deref() != Ok("true") {
+        return Err("Remote user login requires HTTPS at a trusted reverse proxy. Configure TLS and network isolation, then explicitly set RUX_TLS_TERMINATED_AT_PROXY=true".into());
+    }
     if auth_mode == AuthMode::Users {
         if api_token.is_some() || read_token.is_some() {
             return Err("RUX_AUTH_MODE=users does not use shared API tokens; remove RUX_API_TOKEN and RUX_API_READ_TOKEN".into());
