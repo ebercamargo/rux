@@ -1,16 +1,16 @@
 # RUX security (experimental)
 
-RUX is currently an **experimental language/runtime**. The generated CRUD is **not yet suitable for sensitive production workloads** or multi-user applications. In particular, it does not currently provide end-user login, sessions, per-record authorization, encryption in transit, or an independently audited security model.
+RUX is an **experimental language/runtime**, not yet approved for sensitive production workloads. It now includes preliminary browser login, revocable sessions, per-user record authorization and optional tenant memberships. These features are **not independently audited**, do not provide built-in TLS, and are not a substitute for a complete security review.
 
 ## Secure runtime defaults
 
 - The native CRUD binds to `127.0.0.1:3000` by default.
-- Remote binds require an explicit opt-in, `RUX_ALLOWED_HOSTS`, and either a configured legacy API token or at least one active identity in `RUX_AUTH_MODE=identities`.
+- Remote binds require an explicit opt-in and `RUX_ALLOWED_HOSTS`. The configured authentication mode must also be initialized with appropriate credentials or active users.
 - All HTTP routes are rate-limited by **TCP peer IP**, defaulting to **120 requests/minute** (`RUX_RATE_LIMIT_PER_MINUTE`). At a reverse proxy, peer IP is usually the proxy's address, not the end user's address: enforce per-client limits at the gateway too.
 - JSON bodies are capped at **32 KiB**.
 - **Legacy mode** uses shared write (`RUX_API_TOKEN`) and optional read-only (`RUX_API_READ_TOKEN`) Bearer tokens.
 - **Identities mode** uses independent per-identity Bearer tokens with `reader`, `editor` and `admin` roles. Token **hashes**, not plaintext tokens, are stored in SQLite. Identity credentials can be revoked immediately. They are **API identities**, not end-user login sessions.
-- `/metrics` is disabled by default. It requires `RUX_EXPOSE_METRICS=true` and a legacy write token or an admin identity.
+- `/metrics` is disabled by default. It requires `RUX_EXPOSE_METRICS=true` and administrator credentials; in tenant mode metrics access is denied to prevent cross-tenant operational disclosure.
 - Host headers are checked against explicitly allowed names, and browser cross-origin writes are rejected. CORS remains closed; no external origin is allowed by default.
 - Common response-hardening headers are set. HTTPS/TLS is **not implemented by RUX itself**; provide TLS at a trusted reverse proxy or ingress.
 
@@ -123,7 +123,7 @@ For automated provisioning, `rux user create <project> <username> <role> --passw
 - The frontend includes CSRF tokens for state-changing requests. The browser cookie is not accessible to JavaScript. The generated script is restricted by a Content Security Policy hash.
 - Remote browser login requires `RUX_ALLOWED_HOSTS`, an explicit remote bind opt-in, and `RUX_TLS_TERMINATED_AT_PROXY=true` **only after** deploying HTTPS termination and blocking public direct access to the backend. The switch is an operator assertion, not a TLS verifier.
 - On remote or production deployments, session cookies have the `Secure` attribute. Use HTTPS at the reverse proxy. A raw HTTP backend exposed directly to the internet is not a supported secure deployment.
-- This is not yet a multi-tenant security system. **Records are still shared by all authenticated users of the same CRUD app.** Roles are checked per operation, not per record or organization. Do not expose customer-separated or other sensitive workloads until row-level authorization and independent review are implemented.
+- When tenancy is disabled, ordinary users see only their own records, while global administrators see all non-tenant records. With opt-in tenancy, role and SQL filters are scoped to each authenticated company membership. **This remains experimental:** organization-level isolation needs independent audit and additional operational safeguards before sensitive production deployments.
 - The CLI user database is SQLite-specific. Other database backends and login providers are not implemented yet.
 - The legacy, identities and users modes are separate. Do not leave shared API tokens in the environment when using `RUX_AUTH_MODE=users`.
 
@@ -139,12 +139,62 @@ When `RUX_AUTH_MODE=users` is enabled, new records receive an internal `owner_us
 
 Ownership is checked **inside SQL statements** for reads and modifications, so guessing an ID does not bypass the filter. Unauthorized updates return HTTP 404 to avoid disclosing record existence.
 
-**Important:** this is per-user ownership only. It does **not** provide organization/tenant membership, delegation, administrator audit trails, shared records or user-managed ownership transfer. The RUX project remains experimental. Back up the SQLite file before testing changes with important data.
+**Important:** this is per-user ownership only. Optional `RUX_TENANCY=enabled` now supports tenant memberships and access to shared records within a tenant, but does not yet provide delegated administration, audit trails or user-managed ownership transfers. The RUX project remains experimental. Back up the SQLite file before testing changes with important data.
+
+## Multi-tenant isolation (opt-in, experimental)
+
+**Back up the SQLite file** before applying this migration. Existing rows are preserved, not silently assigned to an organization. When enabled, the runtime adds a nullable `tenant_id` field to the `records` table and an index; existing rows retain `tenant_id = NULL`.
+
+### Provision two companies
+
+Stop the application with **Q** before making the backup or changing configuration:
+
+```powershell
+Copy-Item .\teste\records.sqlite .\teste\records.sqlite.bak
+cargo run --release -- tenant create teste acme "Acme Company"
+cargo run --release -- tenant create teste other "Other Company"
+cargo run --release -- tenant grant teste acme admin_local admin
+cargo run --release -- user create teste employee_a editor
+cargo run --release -- user create teste employee_b editor
+cargo run --release -- tenant grant teste acme employee_a editor
+cargo run --release -- tenant grant teste other employee_b editor
+cargo run --release -- tenant list teste
+```
+
+To start with tenant isolation, ensure the existing user-mode login is enabled:
+
+```powershell
+$env:RUX_AUTH_MODE = "users"
+$env:RUX_TENANCY = "enabled"
+cargo run --release -- dev teste/main.rux
+```
+
+The browser shows a **company selector** based on memberships validated server-side. API clients must provide an `X-RUX-TENANT: <tenant UUID>` header. An authenticated user without an active membership receives **403 Forbidden**; requests missing the header receive **400 Bad Request**. The UUID is provided by the tenant listing endpoint `GET /auth/tenants`, which requires a valid login session.
+
+Roles belong to **each tenant**, not to the user's global role. `reader` can read that company's records, `editor` can read/create/edit them, and `admin` can also delete them. A global administrator cannot access another company without an active membership. Tenant members can see the company's shared records, including those created by other members.
+
+To revoke a membership:
+
+```powershell
+cargo run --release -- tenant revoke teste other employee_b
+```
+
+Membership is checked on every API request, so subsequent operations are denied. Revocation does not forcibly terminate a request that was already authorized and executing.
+
+### Security boundaries
+
+- `RUX_TENANCY` is `disabled` by default; when `enabled` it **requires** `RUX_AUTH_MODE=users`, at least one active user and one active membership.
+- The runtime assigns `tenant_id` **server-side**. Client payloads cannot choose ownership. SQL filters restrict read/update/delete by selected tenant as well as active membership.
+- All non-tenant modes, including `legacy`, `identities`, and `users` with tenancy disabled, can **never** read or modify tenant-tagged records.
+- Existing ownerless and personal records are not available in tenant mode, even to tenant administrators; migrate them explicitly under a reviewed data-transfer process.
+- **Tenant-scoped administrators** only administer data in their own organizations. There is no cross-tenant "super admin" bypass.
+- `/metrics` is blocked in tenant mode until an isolated administrative metrics strategy exists.
+- This implementation uses SQLite and runtime SQL authorization; it has not yet been ported to PostgreSQL, formally audited, or stress-tested at large scale. Do not handle sensitive customer data in production yet.
 
 ## Security limitations / planned work
 
 1. Harden the new browser-user login: MFA, password recovery, trusted TLS-provider integration, session policies and security review.
-2. Tenant separation and multi-user sharing/ownership transfer, declarative ABAC, per-record policy audits and denial by default (single-user ownership is now implemented).
+2. Harden tenant isolation: independent security review, data-transfer tooling, delegated tenant administration, immutable audits and granular ABAC (basic tenant membership and SQL filters are now implemented).
 3. Secret providers/rotation and first-class TLS/deployment integration.
 4. Dependency auditing, fuzzing, adversarial integration tests and external security audit.
 5. Migration away from the legacy generated JavaScript server, which is local-only and does not share the native Rust authorization middleware.
