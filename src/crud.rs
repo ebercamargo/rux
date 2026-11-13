@@ -151,7 +151,7 @@ const logoutButton=document.getElementById("logout");
 const crudSection=document.getElementById("crud-section");
 const recordsSection=document.getElementById("records-section");
 function showLogin(){
- sessionMode=true;csrfToken=null;currentRole=null;records=[];render();
+ sessionMode=true;csrfToken=null;currentRole=null;loadVersion++;records=[];render();
  authSection.hidden=false;crudSection.hidden=true;recordsSection.hidden=true;logoutButton.hidden=true;
  document.getElementById("logged-user").textContent="";
 }
@@ -193,7 +193,7 @@ let records=[];
 let cursors=[null],pageIndex=0,hasMore=false,searchTimer=null,loadVersion=0;
 const pageSize=50;
 const remote=location.protocol==="http:"||location.protocol==="https:";
-try{const stored=JSON.parse(localStorage.getItem(key)||"[]");if(Array.isArray(stored))records=stored;}
+if(!remote)try{const stored=JSON.parse(localStorage.getItem(key)||"[]");if(Array.isArray(stored))records=stored;}
 catch(e){status.textContent="Não foi possível ler os dados locais.";}
 function persist(){try{localStorage.setItem(key,JSON.stringify(records));return true;}catch(e){status.textContent="Erro ao salvar no armazenamento local.";return false;}}
 async function request(method,url,payload){
