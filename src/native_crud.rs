@@ -230,7 +230,8 @@ fn authorize_api(method: &axum::http::Method, authorization: Option<&str>, write
 const SESSION_COOKIE: &str = "rux_session";
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    let mut tokens = headers.get_all(axum::http::header::COOKIE).iter()
+    let cookies = headers.get_all(axum::http::header::COOKIE);
+    let mut tokens = cookies.iter()
         .filter_map(|header| header.to_str().ok())
         .flat_map(|value| value.split(';'))
         .filter_map(|cookie| cookie.trim().split_once('='))
@@ -782,6 +783,12 @@ mod tests {
         assert_eq!(AuthMode::parse("users").unwrap(), AuthMode::Users);
         assert!(validate_runtime_environment("production", AuthMode::Users, None).is_ok());
         assert_eq!(session_cookie(&HeaderMap::new()), None);
+        let mut headers = HeaderMap::new();
+        let value = format!("rux_session=ruxs_{}", "a".repeat(64));
+        headers.insert(axum::http::header::COOKIE, value.parse().unwrap());
+        assert_eq!(session_cookie(&headers), Some(format!("ruxs_{}", "a".repeat(64))));
+        headers.append(axum::http::header::COOKIE, value.parse().unwrap());
+        assert_eq!(session_cookie(&headers), None);
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::COOKIE, "foo=bar; rux_session=ruxs_123".parse().unwrap());
         assert!(session_cookie(&headers).is_none());
