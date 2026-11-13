@@ -5,6 +5,37 @@ fn generate_api_secret() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
 
+fn prompt_new_user_password() -> Result<String, String> {
+    eprintln!("Password input is hidden. Asterisks (*) indicate typed characters.");
+    for attempt in 1..=3 {
+        let config = rpassword::ConfigBuilder::new()
+            .password_feedback_mask('*')
+            .build();
+        let password = rpassword::prompt_password_with_config("Password (12-128 UTF-8 bytes): ", config)
+            .map_err(|error| format!("cannot read password: {error}"))?;
+        if !(12..=128).contains(&password.len()) {
+            eprintln!("Invalid password length: received {} UTF-8 bytes; 12-128 required.", password.len());
+            if password.is_empty() {
+                eprintln!("No password was received. Type a password, then press Enter.");
+            }
+            if attempt < 3 { eprintln!("Try again ({}/3).", attempt + 1); }
+            continue;
+        }
+        let config = rpassword::ConfigBuilder::new()
+            .password_feedback_mask('*')
+            .build();
+        let confirmation = rpassword::prompt_password_with_config("Confirm password: ", config)
+            .map_err(|error| format!("cannot read password confirmation: {error}"))?;
+        if password != confirmation {
+            eprintln!("Passwords do not match.");
+            if attempt < 3 { eprintln!("Try again ({}/3).", attempt + 1); }
+            continue;
+        }
+        return Ok(password);
+    }
+    Err("User creation cancelled after 3 unsuccessful attempts. No account was created.".into())
+}
+
 fn create_project(name: &str) -> Result<(), String> {
     if name.is_empty() || !name.chars().next().unwrap().is_ascii_alphabetic()
         || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
@@ -293,22 +324,10 @@ fn main() {
             }
         }
         [_, operation, subcommand, project, name, role] if operation == "user" && subcommand == "create" => {
-            let password = match rpassword::prompt_password("Password (12-128 UTF-8 bytes): ") {
+            let password = match prompt_new_user_password() {
                 Ok(value) => value,
-                Err(error) => { eprintln!("RUX user error: cannot read password: {error}"); process::exit(1); }
+                Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
             };
-            if !(12..=128).contains(&password.len()) {
-                eprintln!("RUX user error: password must be between 12 and 128 UTF-8 bytes. Choose a longer passphrase; accents and emojis may use multiple bytes.");
-                process::exit(1);
-            }
-            let confirmation = match rpassword::prompt_password("Confirm password: ") {
-                Ok(value) => value,
-                Err(error) => { eprintln!("RUX user error: cannot read confirmation: {error}"); process::exit(1); }
-            };
-            if password != confirmation {
-                eprintln!("RUX user error: passwords do not match");
-                process::exit(1);
-            }
             match rux::user_auth::create_in_project(Path::new(project), name, &password, role) {
                 Ok(()) => println!("User created: {name} ({role})"),
                 Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
