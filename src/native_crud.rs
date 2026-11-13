@@ -1,5 +1,5 @@
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
-use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit, ConnectInfo}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::get, Json, Router};
+use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit, ConnectInfo}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
@@ -8,14 +8,15 @@ use std::time::{Duration, Instant};
 use axum::{middleware::{self, Next}, extract::Request};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AuthMode { Legacy, Identities }
+enum AuthMode { Legacy, Identities, Users }
 
 impl AuthMode {
     fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "legacy" => Ok(Self::Legacy),
             "identities" => Ok(Self::Identities),
-            _ => Err("RUX_AUTH_MODE must be legacy or identities".into()),
+            "users" => Ok(Self::Users),
+            _ => Err("RUX_AUTH_MODE must be legacy, identities, or users".into()),
         }
     }
 }
@@ -29,6 +30,7 @@ struct AppState {
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
     auth_mode: AuthMode,
+    secure_cookie: bool,
     allowed_hosts: Arc<Vec<String>>,
     rate_windows: Arc<Mutex<HashMap<IpAddr, ClientWindow>>>,
     rate_limit_per_minute: u32,
@@ -224,6 +226,121 @@ fn authorize_api(method: &axum::http::Method, authorization: Option<&str>, write
         && read_token.is_some_and(|token| token_matches(header, token))
 }
 
+
+const SESSION_COOKIE: &str = "rux_session";
+
+fn session_cookie(headers: &HeaderMap) -> Option<String> {
+    let mut tokens = headers.get_all(axum::http::header::COOKIE).iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter(|(name, _)| *name == SESSION_COOKIE)
+        .map(|(_, value)| value.to_owned());
+    let first = tokens.next()?;
+    if tokens.next().is_some() || first.len() != 69 || !first.starts_with("ruxs_") {
+        return None;
+    }
+    Some(first)
+}
+
+async fn browser_session(state: &AppState, headers: &HeaderMap)
+    -> Result<(String, super::user_auth::Session), StatusCode>
+{
+    let token = session_cookie(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let _db_permit = acquire_db(state).await?;
+    let pool = state.db.clone();
+    let lookup = token.clone();
+    let session = tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::user_auth::session(&db, &lookup, super::user_auth::unix_now())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    Ok((token, session.ok_or(StatusCode::UNAUTHORIZED)?))
+}
+
+async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str)
+    -> Result<(), StatusCode>
+{
+    let (_, session) = browser_session(state, headers).await?;
+    if !super::user_auth::can(&session.role, operation) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !matches!(operation, "GET" | "HEAD" | "METRICS") {
+        let csrf = headers.get("x-rux-csrf").and_then(|header| header.to_str().ok())
+            .ok_or(StatusCode::FORBIDDEN)?;
+        if !super::user_auth::csrf_matches(&session.csrf, csrf) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+}
+
+async fn browser_login(State(state): State<AppState>, Json(form): Json<LoginForm>)
+    -> Result<(HeaderMap, Json<Value>), StatusCode>
+{
+    if state.auth_mode != AuthMode::Users { return Err(StatusCode::NOT_FOUND); }
+    if form.username.len() > 64 || form.password.len() > 128 {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let _db_permit = acquire_db(&state).await?;
+    let pool = state.db.clone();
+    let login = tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::user_auth::login(&db, &form.username, &form.password, super::user_auth::unix_now())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let secure = if state.secure_cookie { "; Secure" } else { "" };
+    let cookie = format!("{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        SESSION_COOKIE, login.token, super::user_auth::SESSION_SECONDS, secure);
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    Ok((headers, Json(json!({
+        "username": login.session.username,
+        "role": login.session.role,
+        "expiresAt": login.session.expires_at,
+        "csrf": login.session.csrf,
+    }))))
+}
+
+async fn browser_me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, StatusCode> {
+    if state.auth_mode != AuthMode::Users { return Err(StatusCode::NOT_FOUND); }
+    let (_, session) = browser_session(&state, &headers).await?;
+    Ok(Json(json!({
+        "username": session.username, "role": session.role,
+        "expiresAt": session.expires_at, "csrf": session.csrf
+    })))
+}
+
+async fn browser_logout(State(state): State<AppState>, headers: HeaderMap)
+    -> Result<(HeaderMap, Json<Value>), StatusCode>
+{
+    if state.auth_mode != AuthMode::Users { return Err(StatusCode::NOT_FOUND); }
+    let (token, session) = browser_session(&state, &headers).await?;
+    let csrf = headers.get("x-rux-csrf").and_then(|value| value.to_str().ok())
+        .ok_or(StatusCode::FORBIDDEN)?;
+    if !super::user_auth::csrf_matches(&session.csrf, csrf) { return Err(StatusCode::FORBIDDEN); }
+    let _db_permit = acquire_db(&state).await?;
+    let pool = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::user_auth::logout(&db, &token).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    let secure = if state.secure_cookie { "; Secure" } else { "" };
+    let cookie = format!("{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}", SESSION_COOKIE, secure);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    Ok((response_headers, Json(json!({"loggedOut":true}))))
+}
+
 async fn check_identity(state: &AppState, authorization: Option<&str>, operation: &str) -> Result<(), StatusCode> {
     let _db_permit = acquire_db(state).await?;
     let pool = state.db.clone();
@@ -278,6 +395,7 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
                 }
             }
             AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
+            AuthMode::Users => check_browser(&state, request.headers(), &operation).await?,
         }
     }
     let start = Instant::now();
@@ -292,6 +410,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
         .and_then(|value| value.to_str().ok());
     match state.auth_mode {
         AuthMode::Identities => check_identity(&state, bearer, "METRICS").await?,
+        AuthMode::Users => check_browser(&state, &headers, "METRICS").await?,
         AuthMode::Legacy => {
             let authorized = state.api_token.as_deref()
                 .is_some_and(|expected| bearer.is_some_and(|value| token_matches(value, expected)));
@@ -463,6 +582,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
             .map_err(|e| e.to_string())?;
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
+        super::user_auth::initialize(&connection).map_err(|e| e.to_string())?;
     }
     let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "120".into())
@@ -535,8 +655,18 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             return Err("RUX_AUTH_MODE=identities requires at least one active identity. Run: rux identity create <app-directory> <name> admin".into());
         }
     }
+    if auth_mode == AuthMode::Users {
+        if api_token.is_some() || read_token.is_some() {
+            return Err("RUX_AUTH_MODE=users does not use shared API tokens; remove RUX_API_TOKEN and RUX_API_READ_TOKEN".into());
+        }
+        let connection = db.get().map_err(|e| e.to_string())?;
+        if super::user_auth::enabled_count(&connection).map_err(|e| e.to_string())? == 0 {
+            return Err("RUX_AUTH_MODE=users requires an active login user. Run: rux user create <app-directory> <name> admin".into());
+        }
+    }
+    let secure_cookie = environment == "production" || !address.ip().is_loopback();
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
     let state_for_host = state.clone();
     let router = Router::new()
@@ -549,6 +679,14 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         .route("/api/records/{id}", axum::routing::put(update).delete(delete))
         .route_layer(middleware::from_fn_with_state(state.clone(), limit_api))
         .with_state(state.clone());
+    let router = if auth_mode == AuthMode::Users {
+        router
+            .route("/auth/login", post(browser_login).with_state(state.clone()))
+            .route("/auth/session", get(browser_me).with_state(state.clone()))
+            .route("/auth/logout", post(browser_logout).with_state(state.clone()))
+    } else {
+        router
+    };
     let router = if std::env::var("RUX_EXPOSE_METRICS").as_deref() == Ok("true") {
         router.route("/metrics", get(metrics).with_state(state))
     } else {
@@ -584,7 +722,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
 fn validate_runtime_environment(environment: &str, mode: AuthMode, api_token: Option<&str>) -> Result<(), String> {
     match environment {
         "development" | "test" => Ok(()),
-        "production" if mode == AuthMode::Identities => Ok(()),
+        "production" if mode == AuthMode::Identities || mode == AuthMode::Users => Ok(()),
         "production" => {
             if api_token.is_none_or(|token| token.len() < 32) {
                 Err("Production legacy mode requires RUX_API_TOKEN with at least 32 characters. Prefer RUX_AUTH_MODE=identities and HTTPS at ingress.".into())
@@ -637,6 +775,15 @@ mod tests {
         assert!(!within_rate_limit(&windows, first, 2, now));
         assert!(within_rate_limit(&windows, second, 2, now));
         assert!(within_rate_limit(&windows, first, 2, now + Duration::from_secs(60)));
+    }
+    #[test]
+    fn browser_user_mode_requires_explicit_selection() {
+        assert_eq!(AuthMode::parse("users").unwrap(), AuthMode::Users);
+        assert!(validate_runtime_environment("production", AuthMode::Users, None).is_ok());
+        assert_eq!(session_cookie(&HeaderMap::new()), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, "foo=bar; rux_session=ruxs_123".parse().unwrap());
+        assert!(session_cookie(&headers).is_none());
     }
     #[test]
     fn identity_mode_is_explicit_and_production_compatible() {
@@ -706,6 +853,7 @@ mod tests {
             api_token: None,
             read_token: None,
             auth_mode: AuthMode::Legacy,
+            secure_cookie: false,
             allowed_hosts: Arc::new(vec!["localhost".into()]),
             rate_windows: Arc::new(Mutex::new(HashMap::new())),
             rate_limit_per_minute: 120,
