@@ -708,7 +708,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let manifest_content = std::fs::read_to_string(directory.join("manifest.webmanifest"))
         .map_err(|e| format!("cannot read manifest: {e}"))?;
     let manager = SqliteConnectionManager::file(directory.join("records.sqlite"))
-        .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout=5000;"));
+        .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;"));
     let pool_size: u32 = std::env::var("RUX_DB_POOL_SIZE")
         .unwrap_or_else(|_| "8".into())
         .parse().map_err(|_| "RUX_DB_POOL_SIZE must be an integer".to_string())?;
@@ -783,9 +783,10 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let allowed_hosts = allowed_host_names(address.ip(), std::env::var("RUX_ALLOWED_HOSTS").ok().as_deref())?;
     let auth_mode = AuthMode::parse(&std::env::var("RUX_AUTH_MODE").unwrap_or_else(|_| "legacy".into()))?;
-    let tenancy_enabled = match std::env::var("RUX_TENANCY").as_deref() {
-        Ok("enabled") => true,
-        Ok("disabled") | Err(std::env::VarError::NotPresent) => false,
+    let tenancy_enabled = match std::env::var("RUX_TENANCY") {
+        Ok(value) if value == "enabled" => true,
+        Ok(value) if value == "disabled" => false,
+        Err(std::env::VarError::NotPresent) => false,
         _ => return Err("RUX_TENANCY must be enabled or disabled".into()),
     };
     if tenancy_enabled && auth_mode != AuthMode::Users {
