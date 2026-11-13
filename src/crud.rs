@@ -70,7 +70,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 <title>RUX | __RUX_TITLE__</title><link rel="manifest" href="/manifest.webmanifest">
 <style>
 :root{font-family:system-ui,-apple-system,sans-serif;color-scheme:light;background:#f5f6fa;color:#202333}
-*{box-sizing:border-box}body{margin:0;padding:24px}main{max-width:1050px;margin:auto}
+*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding:24px}main{max-width:1050px;margin:auto}
 h1{margin:0 0 8px}p{color:#515769}section{background:white;border:1px solid #e2e5ee;border-radius:14px;padding:22px;margin-top:20px}
 form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;align-items:end}
 label{display:grid;gap:6px;font-weight:600}input,select{width:100%;padding:12px;border:1px solid #bfc5d2;border-radius:8px;font:inherit}
