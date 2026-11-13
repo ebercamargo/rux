@@ -31,6 +31,7 @@ struct AppState {
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
     auth_mode: AuthMode,
+    tenancy_enabled: bool,
     secure_cookie: bool,
     allowed_hosts: Arc<Vec<String>>,
     rate_windows: Arc<Mutex<HashMap<IpAddr, ClientWindow>>>,
@@ -260,11 +261,11 @@ async fn browser_session(state: &AppState, headers: &HeaderMap)
     Ok((token, session.ok_or(StatusCode::UNAUTHORIZED)?))
 }
 
-async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str)
+async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str, check_global_role: bool)
     -> Result<super::user_auth::Session, StatusCode>
 {
     let (_, session) = browser_session(state, headers).await?;
-    if !super::user_auth::can(&session.role, operation) {
+    if check_global_role && !super::user_auth::can(&session.role, operation) {
         return Err(StatusCode::FORBIDDEN);
     }
     if !matches!(operation, "GET" | "HEAD" | "METRICS") {
@@ -360,6 +361,48 @@ async fn check_identity(state: &AppState, authorization: Option<&str>, operation
     }
 }
 
+
+#[derive(Clone, Debug)]
+struct TenantContext {
+    id: String,
+    role: String,
+}
+
+async fn verified_tenant(state: &AppState, user_id: &str, id: &str)
+    -> Result<super::tenant::Membership, StatusCode>
+{
+    if uuid::Uuid::parse_str(id).is_err() { return Err(StatusCode::BAD_REQUEST); }
+    let _db_permit = acquire_db(state).await?;
+    let pool = state.db.clone();
+    let user_id = user_id.to_owned();
+    let id = id.to_owned();
+    let membership = tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::tenant::membership(&db, &user_id, &id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    membership.ok_or(StatusCode::FORBIDDEN)
+}
+
+async fn browser_tenants(State(state): State<AppState>, headers: HeaderMap)
+    -> Result<Json<Value>, StatusCode>
+{
+    if state.auth_mode != AuthMode::Users { return Err(StatusCode::NOT_FOUND); }
+    let (_, principal) = browser_session(&state, &headers).await?;
+    if !state.tenancy_enabled {
+        return Ok(Json(json!({"enabled": false, "tenants": []})));
+    }
+    let _db_permit = acquire_db(&state).await?;
+    let pool = state.db.clone();
+    let user_id = principal.user_id;
+    let tenants = tokio::task::spawn_blocking(move || {
+        let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        super::tenant::memberships(&db, &user_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    Ok(Json(json!({"enabled": true, "tenants": tenants})))
+}
+
 async fn limit_api(State(state): State<AppState>, mut request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
     if !state.accepting.load(Ordering::Acquire) {
@@ -399,7 +442,19 @@ async fn limit_api(State(state): State<AppState>, mut request: Request, next: Ne
             }
             AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
             AuthMode::Users => {
-                let principal = check_browser(&state, &auth_headers, &operation).await?;
+                let principal = check_browser(&state, &auth_headers, &operation, !state.tenancy_enabled).await?;
+                if state.tenancy_enabled {
+                    let requested_tenant = auth_headers.get("x-rux-tenant")
+                        .and_then(|header| header.to_str().ok())
+                        .ok_or(StatusCode::BAD_REQUEST)?;
+                    let membership = verified_tenant(&state, &principal.user_id, requested_tenant).await?;
+                    if !super::user_auth::can(&membership.role, &operation) {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+                    request.extensions_mut().insert(TenantContext {
+                        id: membership.id, role: membership.role,
+                    });
+                }
                 request.extensions_mut().insert(principal);
             },
         }
@@ -416,7 +471,8 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
         .and_then(|value| value.to_str().ok());
     match state.auth_mode {
         AuthMode::Identities => check_identity(&state, bearer, "METRICS").await?,
-        AuthMode::Users => check_browser(&state, &headers, "METRICS").await?,
+        AuthMode::Users if state.tenancy_enabled => return Err(StatusCode::FORBIDDEN),
+        AuthMode::Users => { check_browser(&state, &headers, "METRICS", true).await?; },
         AuthMode::Legacy => {
             let authorized = state.api_token.as_deref()
                 .is_some_and(|expected| bearer.is_some_and(|value| token_matches(value, expected)));
@@ -658,6 +714,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             .map_err(|e| e.to_string())?;
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
         super::user_auth::initialize(&connection).map_err(|e| e.to_string())?;
+        super::tenant::initialize(&connection).map_err(|e| e.to_string())?;
     }
     let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "120".into())
@@ -697,6 +754,15 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let allowed_hosts = allowed_host_names(address.ip(), std::env::var("RUX_ALLOWED_HOSTS").ok().as_deref())?;
     let auth_mode = AuthMode::parse(&std::env::var("RUX_AUTH_MODE").unwrap_or_else(|_| "legacy".into()))?;
+    let tenancy_enabled = match std::env::var("RUX_TENANCY").as_deref() {
+        Ok("enabled") => true,
+        Ok("disabled") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("RUX_TENANCY must be enabled or disabled".into()),
+    };
+    if tenancy_enabled && auth_mode != AuthMode::Users {
+        return Err("RUX_TENANCY=enabled requires RUX_AUTH_MODE=users. Tenant data cannot be accessed using shared API credentials.".into());
+    }
+
     let api_token = std::env::var("RUX_API_TOKEN").ok().filter(|value| !value.is_empty());
     if auth_mode == AuthMode::Legacy && !address.ip().is_loopback()
         && api_token.as_ref().is_none_or(|token| token.len() < 32) {
@@ -743,9 +809,15 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             return Err("RUX_AUTH_MODE=users requires an active login user. Run: rux user create <app-directory> <name> admin".into());
         }
     }
+    if tenancy_enabled {
+        let connection = db.get().map_err(|e| e.to_string())?;
+        if super::tenant::active_count(&connection).map_err(|e| e.to_string())? == 0 {
+            return Err("RUX_TENANCY=enabled requires an active tenant membership. Use: rux tenant create / grant".into());
+        }
+    }
     let secure_cookie = environment == "production" || !address.ip().is_loopback();
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), csp_header: Arc::new(csp_header), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), csp_header: Arc::new(csp_header), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, tenancy_enabled, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
     let state_for_host = state.clone();
     let state_for_security = state.clone();
@@ -764,6 +836,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
             .route("/auth/login", post(browser_login).with_state(state.clone()))
             .route("/auth/session", get(browser_me).with_state(state.clone()))
             .route("/auth/logout", post(browser_logout).with_state(state.clone()))
+            .route("/auth/tenants", get(browser_tenants).with_state(state.clone()))
     } else {
         router
     };
@@ -867,6 +940,11 @@ mod tests {
         assert!(content_security_policy("<html></html>").is_err());
     }
     #[test]
+    fn tenant_mode_requires_user_login() {
+        assert_eq!(AuthMode::parse("users").unwrap(), AuthMode::Users);
+        assert!(AuthMode::parse("tenant").is_err());
+    }
+    #[test]
     fn browser_user_mode_requires_explicit_selection() {
         assert_eq!(AuthMode::parse("users").unwrap(), AuthMode::Users);
         assert!(validate_runtime_environment("production", AuthMode::Users, None).is_ok());
@@ -950,6 +1028,7 @@ mod tests {
             api_token: None,
             read_token: None,
             auth_mode: AuthMode::Legacy,
+            tenancy_enabled: false,
             secure_cookie: false,
             allowed_hosts: Arc::new(vec!["localhost".into()]),
             rate_windows: Arc::new(Mutex::new(HashMap::new())),
