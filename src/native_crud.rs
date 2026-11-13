@@ -971,16 +971,58 @@ mod tests {
     }
 
     #[test]
+    fn record_ownership_isolation_denies_cross_user_access() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT);").unwrap();
+        for (id, owner) in [("legacy", None), ("alice", Some("user-a")), ("bob", Some("user-b"))] {
+            db.execute("INSERT INTO records (id,payload,owner_user_id) VALUES (?1,?2,?3)",
+                params![id, format!("{{\"name\":\"{id}\"}}"), owner]).unwrap();
+        }
+        let visible = |scope: i64, owner: Option<&str>| -> Vec<String> {
+            let mut stmt = db.prepare(LIST_SQL).unwrap();
+            let rows = stmt.query_map(params![i64::MAX, 50, "", "", scope, owner],
+                |row| row.get::<_, String>(1)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(visible(0, None), vec!["legacy"]);
+        assert_eq!(visible(1, Some("user-a")), vec!["alice"]);
+        assert_eq!(visible(1, Some("user-b")), vec!["bob"]);
+        assert_eq!(visible(1, Some("missing")), Vec::<String>::new());
+        assert_eq!(visible(2, Some("user-a")).len(), 3);
+
+        let alice = super::user_auth::Session {
+            user_id: "user-a".into(), username: "alice".into(), role: "editor".into(),
+            expires_at: 1000, csrf: "test".into(),
+        };
+        let editor = record_access(AuthMode::Users, Some(Extension(alice))).unwrap();
+        assert_eq!(editor.scope, 1);
+        assert_eq!(editor.owner_id.as_deref(), Some("user-a"));
+        assert!(matches!(record_access(AuthMode::Users, None), Err(StatusCode::UNAUTHORIZED)));
+
+        assert_eq!(db.execute(
+            "UPDATE records SET payload = ?1 WHERE id = ?2 AND
+             (?3 = 2 OR (?3 = 0 AND owner_user_id IS NULL) OR (?3 = 1 AND owner_user_id = ?4))",
+            params!["{}", "bob", editor.scope, editor.owner_id]
+        ).unwrap(), 0);
+        assert_eq!(db.execute(
+            "DELETE FROM records WHERE id = ?1 AND
+             (?2 = 2 OR (?2 = 0 AND owner_user_id IS NULL) OR (?2 = 1 AND owner_user_id = ?3))",
+            params!["bob", editor.scope, editor.owner_id]
+        ).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM records", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+    }
+
+    #[test]
     fn search_uses_bound_parameters_and_resists_sql_injection() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);").unwrap();
+        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT);").unwrap();
         db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)",
             params!["one", r#"{"nome":"Alice","email":"alice@example.com"}"#]).unwrap();
         db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)",
             params!["two", r#"{"nome":"Bob","email":"bob@example.com"}"#]).unwrap();
         let count = |q: &str, field: &str| -> usize {
             let mut statement = db.prepare(LIST_SQL).unwrap();
-            let rows = statement.query_map(params![i64::MAX, 50, q, field], |row| row.get::<_, String>(1))
+            let rows = statement.query_map(params![i64::MAX, 50, q, field, 0, Option::<String>::None], |row| row.get::<_, String>(1))
                 .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
             rows.len()
         };
