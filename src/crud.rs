@@ -143,7 +143,7 @@ const body=document.getElementById("table-body");
 const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
-let csrfToken=null,sessionMode=false,currentRole=null,tenancyEnabled=false,activeTenant=null;
+let csrfToken=null,sessionMode=false,currentRole=null,tenancyEnabled=false,activeTenant=null,loggedUsername="";
 const authSection=document.getElementById("auth-section");
 const authStatus=document.getElementById("auth-status");
 const authForm=document.getElementById("auth-form");
@@ -154,13 +154,13 @@ const tenantStatus=document.getElementById("tenant-status");
 const crudSection=document.getElementById("crud-section");
 const recordsSection=document.getElementById("records-section");
 function showLogin(){
- sessionMode=true;csrfToken=null;currentRole=null;tenancyEnabled=false;activeTenant=null;loadVersion++;records=[];render();
+ sessionMode=true;csrfToken=null;currentRole=null;tenancyEnabled=false;activeTenant=null;loggedUsername="";loadVersion++;records=[];render();
  tenantWrapper.hidden=true;tenantStatus.textContent="";
  authSection.hidden=false;crudSection.hidden=true;recordsSection.hidden=true;logoutButton.hidden=true;
  document.getElementById("logged-user").textContent="";
 }
 function showAuthenticated(user){
- sessionMode=true;csrfToken=user.csrf;currentRole=user.role;
+ sessionMode=true;csrfToken=user.csrf;currentRole=user.role;loggedUsername=user.username;
  authSection.hidden=true;crudSection.hidden=user.role==="reader";recordsSection.hidden=false;
  logoutButton.hidden=false;
  document.getElementById("logged-user").textContent=user.username+" ("+user.role+")";
@@ -169,6 +169,7 @@ function showAuthenticated(user){
 function applyTenantSelection(){
  const chosen=[...tenantSelect.options].find(option=>option.value===activeTenant);
  currentRole=chosen?.dataset.role||null;
+ document.getElementById("logged-user").textContent=loggedUsername+" ("+(currentRole||"sem acesso")+")";
  crudSection.hidden=!currentRole||currentRole==="reader";
  recordsSection.hidden=!currentRole;
  tenantStatus.textContent=currentRole?"":"Nenhuma empresa vinculada a esta conta.";
@@ -237,7 +238,7 @@ catch(e){status.textContent="Não foi possível ler os dados locais.";}
 function persist(){try{localStorage.setItem(key,JSON.stringify(records));return true;}catch(e){status.textContent="Erro ao salvar no armazenamento local.";return false;}}
 async function request(method,url,payload){
  const headers={"Content-Type":"application/json"};
- if(tenancyEnabled){
+ if(tenancyEnabled&&url.startsWith("/api/")){
   if(!activeTenant)throw Error("Selecione uma empresa antes de acessar os dados.");
   headers["X-RUX-TENANT"]=activeTenant;
  }
