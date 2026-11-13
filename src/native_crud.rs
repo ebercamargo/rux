@@ -1079,16 +1079,63 @@ mod tests {
     }
 
     #[test]
+    fn tenant_scope_cannot_cross_companies_even_as_admin() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE records (
+            id TEXT PRIMARY KEY, payload TEXT NOT NULL,
+            owner_user_id TEXT, tenant_id TEXT);").unwrap();
+        for (id, owner, tenant) in [
+            ("legacy", None, None),
+            ("personal", Some("user-a"), None),
+            ("acme-row", Some("user-a"), Some("tenant-acme")),
+            ("other-row", Some("user-b"), Some("tenant-other")),
+        ] {
+            db.execute("INSERT INTO records(id,payload,owner_user_id,tenant_id) VALUES (?1,?2,?3,?4)",
+                params![id, format!("{{\"name\":\"{id}\"}}"), owner, tenant]).unwrap();
+        }
+        let user = crate::user_auth::Session {
+            user_id: "user-a".into(), username: "alice".into(), role: "admin".into(),
+            expires_at: 1000, csrf: "test".into(),
+        };
+        let local_admin = record_access(AuthMode::Users, Some(Extension(user.clone())), None, false).unwrap();
+        let company_admin = record_access(AuthMode::Users, Some(Extension(user)),
+            Some(Extension(TenantContext { id: "tenant-acme".into() })), true).unwrap();
+        assert_eq!(local_admin.scope, 2);
+        assert_eq!(company_admin.scope, 3);
+        assert!(record_access(AuthMode::Users, None, None, true).is_err());
+        let visible = |access: &RecordAccess| -> Vec<String> {
+            let mut stmt = db.prepare(LIST_SQL).unwrap();
+            let rows = stmt.query_map(params![i64::MAX, 50, "", "",
+                access.scope, access.owner_id, access.tenant_id],
+                |row| row.get::<_, String>(1)).unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let rows = visible(&company_admin);
+        assert_eq!(rows, vec!["acme-row".to_owned()]);
+        assert_eq!(visible(&local_admin).len(), 2);
+        let query = "UPDATE records SET payload = '{}' WHERE id = ?1 AND
+            ((?2 = 2 AND tenant_id IS NULL)
+             OR (?2 = 3 AND tenant_id = ?3))";
+        assert_eq!(db.execute(query, params!["other-row", company_admin.scope, company_admin.tenant_id]).unwrap(), 0);
+        assert_eq!(db.execute(query, params!["legacy", company_admin.scope, company_admin.tenant_id]).unwrap(), 0);
+        let delete = "DELETE FROM records WHERE id = ?1 AND
+            ((?2 = 2 AND tenant_id IS NULL)
+             OR (?2 = 3 AND tenant_id = ?3))";
+        assert_eq!(db.execute(delete, params!["other-row", company_admin.scope, company_admin.tenant_id]).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM records", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
+    }
+
+    #[test]
     fn record_ownership_isolation_denies_cross_user_access() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT);").unwrap();
+        db.execute_batch("CREATE TABLE records (id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT, tenant_id TEXT);").unwrap();
         for (id, owner) in [("legacy", None), ("alice", Some("user-a")), ("bob", Some("user-b"))] {
             db.execute("INSERT INTO records (id,payload,owner_user_id) VALUES (?1,?2,?3)",
                 params![id, format!("{{\"name\":\"{id}\"}}"), owner]).unwrap();
         }
         let visible = |scope: i64, owner: Option<&str>| -> Vec<String> {
             let mut stmt = db.prepare(LIST_SQL).unwrap();
-            let rows = stmt.query_map(params![i64::MAX, 50, "", "", scope, owner],
+            let rows = stmt.query_map(params![i64::MAX, 50, "", "", scope, owner, Option::<String>::None],
                 |row| row.get::<_, String>(1)).unwrap();
             rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
         };
@@ -1102,10 +1149,10 @@ mod tests {
             user_id: "user-a".into(), username: "alice".into(), role: "editor".into(),
             expires_at: 1000, csrf: "test".into(),
         };
-        let editor = record_access(AuthMode::Users, Some(Extension(alice))).unwrap();
+        let editor = record_access(AuthMode::Users, Some(Extension(alice)), None, false).unwrap();
         assert_eq!(editor.scope, 1);
         assert_eq!(editor.owner_id.as_deref(), Some("user-a"));
-        assert!(matches!(record_access(AuthMode::Users, None), Err(StatusCode::UNAUTHORIZED)));
+        assert!(matches!(record_access(AuthMode::Users, None, None, false), Err(StatusCode::UNAUTHORIZED)));
 
         assert_eq!(db.execute(
             "UPDATE records SET payload = ?1 WHERE id = ?2 AND
@@ -1130,7 +1177,7 @@ mod tests {
             params!["two", r#"{"nome":"Bob","email":"bob@example.com"}"#]).unwrap();
         let count = |q: &str, field: &str| -> usize {
             let mut statement = db.prepare(LIST_SQL).unwrap();
-            let rows = statement.query_map(params![i64::MAX, 50, q, field, 0, Option::<String>::None], |row| row.get::<_, String>(1))
+            let rows = statement.query_map(params![i64::MAX, 50, q, field, 0, Option::<String>::None, Option::<String>::None], |row| row.get::<_, String>(1))
                 .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
             rows.len()
         };
