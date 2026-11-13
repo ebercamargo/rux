@@ -24,3 +24,5 @@ pub mod project;
 pub mod identity;
 
 pub mod user_auth;
+
+pub mod tenant;
