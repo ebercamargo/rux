@@ -127,10 +127,24 @@ For automated provisioning, `rux user create <project> <username> <role> --passw
 - The CLI user database is SQLite-specific. Other database backends and login providers are not implemented yet.
 - The legacy, identities and users modes are separate. Do not leave shared API tokens in the environment when using `RUX_AUTH_MODE=users`.
 
+## Record ownership in browser-user mode
+
+When `RUX_AUTH_MODE=users` is enabled, new records receive an internal `owner_user_id` set by the server from the authenticated session's **immutable user ID**. Client JSON cannot set or override ownership.
+
+- `reader`: can list only records already owned by this identity (cannot create new ones).
+- `editor`: can list, create and update only owned records; cannot delete.
+- `admin`: can list, create, update and delete all records. Records created by an admin retain that admin as owner.
+- Existing SQLite records are migrated in place with a nullable `owner_user_id`. **No existing record is deleted**; prior records remain ownerless and are visible to admins in `users` mode.
+- `legacy` and `identities` API modes only access records without an owner. They cannot access rows created in `users` mode.
+
+Ownership is checked **inside SQL statements** for reads and modifications, so guessing an ID does not bypass the filter. Unauthorized updates return HTTP 404 to avoid disclosing record existence.
+
+**Important:** this is per-user ownership only. It does **not** provide organization/tenant membership, delegation, administrator audit trails, shared records or user-managed ownership transfer. The RUX project remains experimental. Back up the SQLite file before testing changes with important data.
+
 ## Security limitations / planned work
 
 1. Harden the new browser-user login: MFA, password recovery, trusted TLS-provider integration, session policies and security review.
-2. Declarative RBAC/ABAC, per-record and tenant isolation with deny-by-default semantics.
+2. Tenant separation and multi-user sharing/ownership transfer, declarative ABAC, per-record policy audits and denial by default (single-user ownership is now implemented).
 3. Secret providers/rotation and first-class TLS/deployment integration.
 4. Dependency auditing, fuzzing, adversarial integration tests and external security audit.
 5. Migration away from the legacy generated JavaScript server, which is local-only and does not share the native Rust authorization middleware.
