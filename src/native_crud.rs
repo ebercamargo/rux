@@ -984,9 +984,9 @@ mod tests {
                 |row| row.get::<_, String>(1)).unwrap();
             rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
         };
-        assert_eq!(visible(0, None), vec!["legacy"]);
-        assert_eq!(visible(1, Some("user-a")), vec!["alice"]);
-        assert_eq!(visible(1, Some("user-b")), vec!["bob"]);
+        assert_eq!(visible(0, None), vec!["legacy".to_owned()]);
+        assert_eq!(visible(1, Some("user-a")), vec!["alice".to_owned()]);
+        assert_eq!(visible(1, Some("user-b")), vec!["bob".to_owned()]);
         assert_eq!(visible(1, Some("missing")), Vec::<String>::new());
         assert_eq!(visible(2, Some("user-a")).len(), 3);
 
