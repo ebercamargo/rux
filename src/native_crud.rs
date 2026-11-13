@@ -27,6 +27,7 @@ struct AppState {
     fields: Arc<Vec<(String, String)>>,
     html: Arc<String>,
     manifest: Arc<String>,
+    csp_header: Arc<String>,
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
     auth_mode: AuthMode,
@@ -428,7 +429,25 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
     })))
 }
 
-async fn security_headers(request: Request, next: Next) -> axum::response::Response {
+
+fn content_security_policy(html: &str) -> Result<String, String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let start = html.find("<script>").ok_or("Generated UI is missing its script")? + "<script>".len();
+    let end = html[start..].find("</script>").ok_or("Generated UI has an unterminated script")? + start;
+    if html[end + "</script>".len()..].contains("<script>") {
+        return Err("Generated UI must use a single audited inline script".into());
+    }
+    let hash = sha2::Sha256::digest(html[start..end].as_bytes());
+    let script_hash = base64::engine::general_purpose::STANDARD.encode(hash);
+    Ok(format!(
+        "default-src 'none'; script-src 'sha256-{script_hash}'; style-src 'unsafe-inline'; \
+         connect-src 'self'; img-src 'self' data:; manifest-src 'self'; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'"
+    ))
+}
+
+async fn security_headers(State(state): State<AppState>, request: Request, next: Next) -> axum::response::Response {
     use axum::http::header::{HeaderValue, CACHE_CONTROL};
     let is_api = request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/auth/");
     let mut response = next.run(request).await;
@@ -437,7 +456,7 @@ async fn security_headers(request: Request, next: Next) -> axum::response::Respo
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     headers.insert("permissions-policy", HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
-    headers.insert("content-security-policy", HeaderValue::from_static("frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'"));
+    headers.insert("content-security-policy", HeaderValue::from_str(&state.csp_header).expect("validated CSP"));
     if is_api { headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store")); }
     response
 }
@@ -568,6 +587,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     }
     let html = std::fs::read_to_string(directory.join("index.html"))
         .map_err(|e| format!("cannot read generated UI: {e}"))?;
+    let csp_header = content_security_policy(&html)?;
     let manifest_content = std::fs::read_to_string(directory.join("manifest.webmanifest"))
         .map_err(|e| format!("cannot read manifest: {e}"))?;
     let manager = SqliteConnectionManager::file(directory.join("records.sqlite"))
@@ -668,9 +688,10 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     }
     let secure_cookie = environment == "production" || !address.ip().is_loopback();
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), csp_header: Arc::new(csp_header), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
     let state_for_host = state.clone();
+    let state_for_security = state.clone();
     let router = Router::new()
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -697,7 +718,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let router = router.layer(DefaultBodyLimit::max(32 * 1024))
         .layer(middleware::from_fn_with_state(state_for_rate, rate_gate))
         .layer(middleware::from_fn_with_state(state_for_host, host_origin_guard))
-        .layer(middleware::from_fn(security_headers));
+        .layer(middleware::from_fn_with_state(state_for_security, security_headers));
     let listener = tokio::net::TcpListener::bind(address).await.map_err(|e| e.to_string())?;
     println!("RUX native CRUD: http://{address} (SQLite)");
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
@@ -779,6 +800,16 @@ mod tests {
         assert!(within_rate_limit(&windows, first, 2, now + Duration::from_secs(60)));
     }
     #[test]
+    fn csp_allows_only_the_exact_generated_inline_script() {
+        let html = "<html><script>console.log('hello');</script></html>";
+        let policy = content_security_policy(html).unwrap();
+        assert!(policy.contains("default-src 'none'"));
+        assert!(policy.contains("script-src 'sha256-"));
+        assert!(!policy.contains("script-src 'unsafe-inline'"));
+        assert_ne!(policy, content_security_policy("<html><script>console.log('other');</script></html>").unwrap());
+        assert!(content_security_policy("<html></html>").is_err());
+    }
+    #[test]
     fn browser_user_mode_requires_explicit_selection() {
         assert_eq!(AuthMode::parse("users").unwrap(), AuthMode::Users);
         assert!(validate_runtime_environment("production", AuthMode::Users, None).is_ok());
@@ -858,6 +889,7 @@ mod tests {
             fields: Arc::new(vec![]),
             html: Arc::new(String::new()),
             manifest: Arc::new(String::new()),
+            csp_header: Arc::new(String::new()),
             api_token: None,
             read_token: None,
             auth_mode: AuthMode::Legacy,
