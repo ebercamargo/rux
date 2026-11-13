@@ -293,10 +293,14 @@ fn main() {
             }
         }
         [_, operation, subcommand, project, name, role] if operation == "user" && subcommand == "create" => {
-            let password = match rpassword::prompt_password("Password (12+ characters): ") {
+            let password = match rpassword::prompt_password("Password (12-128 UTF-8 bytes): ") {
                 Ok(value) => value,
                 Err(error) => { eprintln!("RUX user error: cannot read password: {error}"); process::exit(1); }
             };
+            if !(12..=128).contains(&password.len()) {
+                eprintln!("RUX user error: password must be between 12 and 128 UTF-8 bytes. Choose a longer passphrase; accents and emojis may use multiple bytes.");
+                process::exit(1);
+            }
             let confirmation = match rpassword::prompt_password("Confirm password: ") {
                 Ok(value) => value,
                 Err(error) => { eprintln!("RUX user error: cannot read confirmation: {error}"); process::exit(1); }
