@@ -204,3 +204,47 @@ jobs:
           cargo run --quiet -- identity revoke CiIdentity ci_reader >/dev/null
           test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $reader" "$url")" = "401"
           test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $admin" "$url")" = "200"
+
+      - name: Native browser login and CSRF integration
+        run: |
+          set -euo pipefail
+          cat > ci_user_login.rux <<'RUX'
+          app CiUserLogin {
+              data Customer {
+                  name: Text
+              }
+          }
+          RUX
+          PORT=3300 cargo run --quiet -- run ci_user_login.rux > ci-user-seed.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3300/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3300/health/ready >/dev/null
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+          printf '%s\n' 'test-only-super-strong-passphrase!' | cargo run --quiet -- user create CiUserLogin ciadmin admin --password-stdin
+          RUX_AUTH_MODE=users PORT=3300 cargo run --quiet -- run ci_user_login.rux > ci-user-server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; rm -f ci-session-cookies.txt ci-session-login.json' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3300/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          url=http://127.0.0.1:3300
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$url/api/records")" = "401"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' "$url/auth/session")" = "401"
+          umask 077
+          test "$(curl -sS -o ci-session-login.json -w '%{http_code}' -c ci-session-cookies.txt -H 'Content-Type: application/json' -d '{"username":"ciadmin","password":"test-only-super-strong-passphrase!"}' "$url/auth/login")" = "200"
+          csrf=$(python3 -c 'import json; print(json.load(open("ci-session-login.json"))["csrf"])')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt "$url/api/records")" = "200"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt -X POST -H 'Content-Type: application/json' -d '{"name":"A"}' "$url/api/records")" = "403"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt -X POST -H "X-RUX-CSRF: $csrf" -H 'Content-Type: application/json' -d '{"name":"A"}' "$url/api/records")" = "201"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt -X POST -H "X-RUX-CSRF: $csrf" "$url/auth/logout")" = "200"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt "$url/api/records")" = "401"
+          test "$(curl -sS -o ci-session-login.json -w '%{http_code}' -c ci-session-cookies.txt -H 'Content-Type: application/json' -d '{"username":"ciadmin","password":"test-only-super-strong-passphrase!"}' "$url/auth/login")" = "200"
+          cargo run --quiet -- user disable CiUserLogin ciadmin
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt "$url/api/records")" = "401"
