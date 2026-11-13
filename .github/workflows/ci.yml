@@ -248,3 +248,66 @@ jobs:
           test "$(curl -sS -o ci-session-login.json -w '%{http_code}' -c ci-session-cookies.txt -H 'Content-Type: application/json' -d '{"username":"ciadmin","password":"test-only-super-strong-passphrase!"}' "$url/auth/login")" = "200"
           cargo run --quiet -- user disable CiUserLogin ciadmin
           test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-session-cookies.txt "$url/api/records")" = "401"
+
+      - name: Native CRUD per-user row isolation
+        run: |
+          set -euo pipefail
+          cat > ci_owned.rux <<'RUX'
+          app CiOwned {
+              data Person {
+                  name: Text
+              }
+          }
+          RUX
+          PORT=3400 cargo run --quiet -- run ci_owned.rux > ci-owned-init.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3400/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3400/health/ready >/dev/null
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          umask 077
+          printf '%s\n' 'test-only-super-strong-passphrase!' | cargo run --quiet -- user create CiOwned alice_writer editor --password-stdin
+          printf '%s\n' 'test-only-super-strong-passphrase!' | cargo run --quiet -- user create CiOwned bob_writer editor --password-stdin
+          printf '%s\n' 'test-only-super-strong-passphrase!' | cargo run --quiet -- user create CiOwned top_admin admin --password-stdin
+          RUX_AUTH_MODE=users PORT=3400 cargo run --quiet -- run ci_owned.rux > ci-owned-users.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; rm -f ci-owned-*.json ci-owned-*.cookies' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3400/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          url=http://127.0.0.1:3400
+          for user in alice_writer bob_writer top_admin; do
+            curl -fsS -c "ci-owned-$user.cookies" -H 'Content-Type: application/json' \
+              -d "{\"username\":\"$user\",\"password\":\"test-only-super-strong-passphrase!\"}" \
+              "$url/auth/login" > "ci-owned-$user.json"
+          done
+          csrf=$(python3 -c 'import json; print(json.load(open("ci-owned-alice_writer.json"))["csrf"])')
+          curl -fsS -b ci-owned-alice_writer.cookies -H "X-RUX-CSRF: $csrf" \
+            -H 'Content-Type: application/json' -d '{"name":"private Alice"}' \
+            "$url/api/records" > ci-owned-created.json
+          id=$(python3 -c 'import json; print(json.load(open("ci-owned-created.json"))["id"])')
+          curl -fsS -b ci-owned-alice_writer.cookies "$url/api/records" > ci-owned-alice-list.json
+          curl -fsS -b ci-owned-bob_writer.cookies "$url/api/records" > ci-owned-bob-list.json
+          curl -fsS -b ci-owned-top_admin.cookies "$url/api/records" > ci-owned-admin-list.json
+          python3 -c 'import json; assert len(json.load(open("ci-owned-alice-list.json")))==1; assert len(json.load(open("ci-owned-bob-list.json")))==0; assert len(json.load(open("ci-owned-admin-list.json")))==1'
+          bobcsrf=$(python3 -c 'import json; print(json.load(open("ci-owned-bob_writer.json"))["csrf"])')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-owned-bob_writer.cookies \
+            -X PUT -H "X-RUX-CSRF: $bobcsrf" -H 'Content-Type: application/json' \
+            -d '{"name":"stolen"}' "$url/api/records/$id")" = "404"
+          curl -fsS -b ci-owned-alice_writer.cookies "$url/api/records" > ci-owned-after-attack.json
+          python3 -c 'import json; assert json.load(open("ci-owned-after-attack.json"))[0]["name"]=="private Alice"'
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          PORT=3400 cargo run --quiet -- run ci_owned.rux > ci-owned-legacy.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3400/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS "$url/api/records" > ci-owned-legacy-list.json
+          python3 -c 'import json; assert json.load(open("ci-owned-legacy-list.json"))==[]'
