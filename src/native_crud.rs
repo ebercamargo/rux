@@ -1,5 +1,5 @@
 use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::Path, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex}};
-use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit, ConnectInfo}, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
+use axum::{extract::{Path as RoutePath, Query, State, DefaultBodyLimit, ConnectInfo}, Extension, http::{StatusCode, HeaderMap}, response::{Html, IntoResponse}, routing::{get, post}, Json, Router};
 use rusqlite::params;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::{json, Map, Value};
@@ -261,7 +261,7 @@ async fn browser_session(state: &AppState, headers: &HeaderMap)
 }
 
 async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str)
-    -> Result<(), StatusCode>
+    -> Result<super::user_auth::Session, StatusCode>
 {
     let (_, session) = browser_session(state, headers).await?;
     if !super::user_auth::can(&session.role, operation) {
@@ -274,7 +274,7 @@ async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str)
             return Err(StatusCode::FORBIDDEN);
         }
     }
-    Ok(())
+    Ok(session)
 }
 
 #[derive(serde::Deserialize)]
@@ -360,7 +360,7 @@ async fn check_identity(state: &AppState, authorization: Option<&str>, operation
     }
 }
 
-async fn limit_api(State(state): State<AppState>, request: Request, next: Next) -> impl IntoResponse {
+async fn limit_api(State(state): State<AppState>, mut request: Request, next: Next) -> impl IntoResponse {
     state.requests_total.fetch_add(1, Ordering::Relaxed);
     if !state.accepting.load(Ordering::Acquire) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -398,7 +398,10 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
                 }
             }
             AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
-            AuthMode::Users => check_browser(&state, &auth_headers, &operation).await?,
+            AuthMode::Users => {
+                let principal = check_browser(&state, &auth_headers, &operation).await?;
+                request.extensions_mut().insert(principal);
+            },
         }
     }
     let start = Instant::now();
@@ -490,8 +493,31 @@ async fn manifest(State(state): State<AppState>) -> impl IntoResponse {
     ([(axum::http::header::CONTENT_TYPE, "application/manifest+json")], (*state.manifest).clone())
 }
 
+
+#[derive(Clone, Debug)]
+struct RecordAccess {
+    /// 0 = old/local API records only; 1 = own records; 2 = administrator.
+    scope: i64,
+    owner_id: Option<String>,
+}
+
+fn record_access(auth_mode: AuthMode, principal: Option<Extension<super::user_auth::Session>>)
+    -> Result<RecordAccess, StatusCode>
+{
+    match auth_mode {
+        AuthMode::Legacy | AuthMode::Identities => Ok(RecordAccess { scope: 0, owner_id: None }),
+        AuthMode::Users => {
+            let user = principal.ok_or(StatusCode::UNAUTHORIZED)?.0;
+            let scope = if user.role == "admin" { 2 } else { 1 };
+            Ok(RecordAccess { scope, owner_id: Some(user.user_id) })
+        }
+    }
+}
+
 const LIST_SQL: &str = "SELECT rowid, id, payload FROM records
              WHERE rowid < ?1
+               AND (?5 = 2 OR (?5 = 0 AND owner_user_id IS NULL)
+                   OR (?5 = 1 AND owner_user_id = ?6))
                AND (?3 = '' OR EXISTS (
                  SELECT 1 FROM json_each(payload)
                  WHERE (?4 = '' OR json_each.key = ?4)
@@ -507,7 +533,9 @@ struct Page {
     field: Option<String>,
 }
 
-async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result<Json<Value>, StatusCode> {
+async fn list(State(state): State<AppState>, Query(page): Query<Page>,
+    principal: Option<Extension<super::user_auth::Session>>) -> Result<Json<Value>, StatusCode> {
+    let access = record_access(state.auth_mode, principal)?;
     let limit = page.limit.unwrap_or(50).clamp(1, 100);
     let before = page.before.unwrap_or(i64::MAX);
     let query = page.q.unwrap_or_default();
@@ -521,7 +549,7 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let mut stmt = db.prepare(LIST_SQL)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let rows = stmt.query_map(params![before, limit, query, field], |row| {
+        let rows = stmt.query_map(params![before, limit, query, field, access.scope, access.owner_id], |row| {
             let cursor: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             let payload: String = row.get(2)?;
@@ -539,25 +567,34 @@ async fn list(State(state): State<AppState>, Query(page): Query<Page>) -> Result
     }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-async fn create(State(state): State<AppState>, Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
+async fn create(State(state): State<AppState>, principal: Option<Extension<super::user_auth::Session>>,
+    Json(input): Json<Value>) -> Result<(StatusCode, Json<Value>), StatusCode> {
+    let access = record_access(state.auth_mode, principal)?;
     let mut payload = Value::Object(validate(&input, &state.fields)?);
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let id = uuid::Uuid::new_v4().to_string();
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        db.execute("INSERT INTO records (id, payload) VALUES (?1, ?2)", params![id, payload.to_string()])
+        db.execute("INSERT INTO records (id, payload, owner_user_id) VALUES (?1, ?2, ?3)",
+            params![id, payload.to_string(), access.owner_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         payload["id"] = json!(id);
         Ok((StatusCode::CREATED, Json(payload)))
     }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>, Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
+async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
+    principal: Option<Extension<super::user_auth::Session>>,
+    Json(input): Json<Value>) -> Result<Json<Value>, StatusCode> {
+    let access = record_access(state.auth_mode, principal)?;
     let mut payload = Value::Object(validate(&input, &state.fields)?);
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2", params![payload.to_string(), id])
+        let count = db.execute("UPDATE records SET payload = ?1 WHERE id = ?2
+                AND (?3 = 2 OR (?3 = 0 AND owner_user_id IS NULL)
+                    OR (?3 = 1 AND owner_user_id = ?4))",
+                params![payload.to_string(), id, access.scope, access.owner_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if count == 0 { return Err(StatusCode::NOT_FOUND); }
         payload["id"] = json!(id);
@@ -565,11 +602,16 @@ async fn update(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
     }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
-async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Result<impl IntoResponse, StatusCode> {
+async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
+    principal: Option<Extension<super::user_auth::Session>>) -> Result<impl IntoResponse, StatusCode> {
+    let access = record_access(state.auth_mode, principal)?;
     let _db_permit = acquire_db(&state).await?;
     tokio::task::spawn_blocking(move || {
         let db = state.db.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let count = db.execute("DELETE FROM records WHERE id = ?1", params![id])
+        let count = db.execute("DELETE FROM records WHERE id = ?1
+                AND (?2 = 2 OR (?2 = 0 AND owner_user_id IS NULL)
+                    OR (?2 = 1 AND owner_user_id = ?3))",
+                params![id, access.scope, access.owner_id])
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if count == 0 { return Err(StatusCode::NOT_FOUND); }
         Ok(Json(json!({"deleted": true})))
@@ -601,7 +643,18 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
     {
         let connection = db.get().map_err(|e| e.to_string())?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, payload TEXT NOT NULL);")
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT);")
+            .map_err(|e| e.to_string())?;
+        let has_owner_column: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('records') WHERE name = 'owner_user_id'",
+            [], |row| row.get(0)
+        ).map_err(|e| e.to_string())?;
+        if has_owner_column == 0 {
+            connection.execute_batch("ALTER TABLE records ADD COLUMN owner_user_id TEXT")
+                .map_err(|e| format!("Cannot migrate records ownership column: {e}"))?;
+        }
+        connection.execute_batch("CREATE INDEX IF NOT EXISTS records_owner_idx ON records (owner_user_id)")
             .map_err(|e| e.to_string())?;
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
         super::user_auth::initialize(&connection).map_err(|e| e.to_string())?;
