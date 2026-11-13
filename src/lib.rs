@@ -22,3 +22,5 @@ pub fn run(source: &str) -> Result<String, String> {
 pub mod project;
 
 pub mod identity;
+
+pub mod user_auth;
