@@ -385,7 +385,8 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
         }
     };
     if request.uri().path().starts_with("/api/") {
-        let authorization = request.headers().get(axum::http::header::AUTHORIZATION)
+        let auth_headers = request.headers().clone();
+        let authorization = auth_headers.get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok()).map(str::to_owned);
         let operation = request.method().as_str().to_owned();
         match state.auth_mode {
@@ -395,7 +396,7 @@ async fn limit_api(State(state): State<AppState>, request: Request, next: Next) 
                 }
             }
             AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
-            AuthMode::Users => check_browser(&state, request.headers(), &operation).await?,
+            AuthMode::Users => check_browser(&state, &auth_headers, &operation).await?,
         }
     }
     let start = Instant::now();
@@ -428,7 +429,7 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
 
 async fn security_headers(request: Request, next: Next) -> axum::response::Response {
     use axum::http::header::{HeaderValue, CACHE_CONTROL};
-    let is_api = request.uri().path().starts_with("/api/");
+    let is_api = request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/auth/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
