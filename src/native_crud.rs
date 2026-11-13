@@ -990,7 +990,7 @@ mod tests {
         assert_eq!(visible(1, Some("missing")), Vec::<String>::new());
         assert_eq!(visible(2, Some("user-a")).len(), 3);
 
-        let alice = super::user_auth::Session {
+        let alice = crate::user_auth::Session {
             user_id: "user-a".into(), username: "alice".into(), role: "editor".into(),
             expires_at: 1000, csrf: "test".into(),
         };
