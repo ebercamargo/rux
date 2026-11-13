@@ -238,6 +238,7 @@ fn help() {
     println!("  identity list <project>                         List identities (no secrets)");
     println!("  identity revoke <project> <name>                Revoke API identity");
     println!("  user create <project> <name> <reader|editor|admin>  Create login user (password prompt)");
+    println!("  user create <project> <name> <role> --password-stdin  Read password from stdin");
     println!("  user list <project>                            List login users");
     println!("  user disable <project> <name>                  Disable login user and sessions");
     println!("  --version        Print version");
@@ -274,6 +275,21 @@ fn main() {
                     }
                 }
                 Err(error) => { eprintln!("RUX identity error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, name, role, flag]
+            if operation == "user" && subcommand == "create" && flag == "--password-stdin" =>
+        {
+            use std::io::BufRead;
+            let mut password = String::new();
+            if let Err(error) = std::io::stdin().lock().read_line(&mut password) {
+                eprintln!("RUX user error: cannot read password from stdin: {error}");
+                process::exit(1);
+            }
+            let password = password.trim_end_matches(&['\r', '\n'][..]);
+            match rux::user_auth::create_in_project(Path::new(project), name, password, role) {
+                Ok(()) => println!("User created: {name} ({role})"),
+                Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
             }
         }
         [_, operation, subcommand, project, name, role] if operation == "user" && subcommand == "create" => {
