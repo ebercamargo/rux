@@ -25,3 +25,7 @@ regex = "1"
 crossterm = "0.28"
 
 sha2 = "0.10"
+
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rpassword = "7"
