@@ -237,6 +237,9 @@ fn help() {
     println!("  identity create <project> <name> <reader|editor|admin>  Create API identity");
     println!("  identity list <project>                         List identities (no secrets)");
     println!("  identity revoke <project> <name>                Revoke API identity");
+    println!("  user create <project> <name> <reader|editor|admin>  Create login user (password prompt)");
+    println!("  user list <project>                            List login users");
+    println!("  user disable <project> <name>                  Disable login user and sessions");
     println!("  --version        Print version");
     println!("  --help           Show this help");
 }
@@ -271,6 +274,39 @@ fn main() {
                     }
                 }
                 Err(error) => { eprintln!("RUX identity error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, name, role] if operation == "user" && subcommand == "create" => {
+            let password = match rpassword::prompt_password("Password (12+ characters): ") {
+                Ok(value) => value,
+                Err(error) => { eprintln!("RUX user error: cannot read password: {error}"); process::exit(1); }
+            };
+            let confirmation = match rpassword::prompt_password("Confirm password: ") {
+                Ok(value) => value,
+                Err(error) => { eprintln!("RUX user error: cannot read confirmation: {error}"); process::exit(1); }
+            };
+            if password != confirmation {
+                eprintln!("RUX user error: passwords do not match");
+                process::exit(1);
+            }
+            match rux::user_auth::create_in_project(Path::new(project), name, &password, role) {
+                Ok(()) => println!("User created: {name} ({role})"),
+                Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project, name] if operation == "user" && subcommand == "disable" => {
+            match rux::user_auth::disable_in_project(Path::new(project), name) {
+                Ok(true) => println!("User disabled; active sessions revoked: {name}"),
+                Ok(false) => { eprintln!("RUX user error: user not found or already disabled"); process::exit(1); }
+                Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
+            }
+        }
+        [_, operation, subcommand, project] if operation == "user" && subcommand == "list" => {
+            match rux::user_auth::list_in_project(Path::new(project)) {
+                Ok(users) => for (username, role, disabled) in users {
+                    println!("{username} | {role} | {}", if disabled { "DISABLED" } else { "ACTIVE" });
+                },
+                Err(error) => { eprintln!("RUX user error: {error}"); process::exit(1); }
             }
         }
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
