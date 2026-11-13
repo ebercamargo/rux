@@ -73,7 +73,7 @@ const TEMPLATE: &str = r##"<!doctype html>
 *{box-sizing:border-box}body{margin:0;padding:24px}main{max-width:1050px;margin:auto}
 h1{margin:0 0 8px}p{color:#515769}section{background:white;border:1px solid #e2e5ee;border-radius:14px;padding:22px;margin-top:20px}
 form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;align-items:end}
-label{display:grid;gap:6px;font-weight:600}input{width:100%;padding:12px;border:1px solid #bfc5d2;border-radius:8px;font:inherit}
+label{display:grid;gap:6px;font-weight:600}input,select{width:100%;padding:12px;border:1px solid #bfc5d2;border-radius:8px;font:inherit}
 button{padding:11px 15px;border:0;border-radius:8px;background:#4d49bd;color:white;font:inherit;cursor:pointer}
 button.secondary{background:#596273}button.danger{background:#b5263d}
 .actions{display:flex;gap:8px;flex-wrap:wrap}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
@@ -83,7 +83,7 @@ button.secondary{background:#596273}button.danger{background:#b5263d}
 </style>
 </head>
 <body><main>
-<header class="toolbar"><div><h1>CRUD __RUX_TITLE__</h1><p>RUX • Cadastro multiplataforma no navegador</p></div><div><span id="logged-user"></span> <button id="logout" class="secondary" type="button" hidden>Sair</button></div></header>
+<header class="toolbar"><div><h1>CRUD __RUX_TITLE__</h1><p>RUX • Cadastro multiplataforma no navegador</p></div><div class="toolbar"><label id="tenant-wrapper" hidden>Empresa<select id="tenant-select"></select></label><span id="tenant-status" role="status"></span><span id="logged-user"></span> <button id="logout" class="secondary" type="button" hidden>Sair</button></div></header>
 <section id="auth-section" hidden><h2>Login</h2><form id="auth-form"><label>Usuário<input name="username" autocomplete="username" required maxlength="64"></label><label>Senha<input name="password" type="password" autocomplete="current-password" required></label><button type="submit">Entrar</button></form><p id="auth-status" role="status" aria-live="polite"></p></section>
 <section id="crud-section"><h2 id="form-title">Novo registro</h2><form id="record-form"></form><p id="status" role="status" aria-live="polite"></p></section>
 <section id="records-section"><div class="toolbar"><h2>Registros</h2><input id="search" type="search" placeholder="Pesquisar..." aria-label="Pesquisar registros"></div>
@@ -143,15 +143,19 @@ const body=document.getElementById("table-body");
 const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
-let csrfToken=null,sessionMode=false,currentRole=null;
+let csrfToken=null,sessionMode=false,currentRole=null,tenancyEnabled=false,activeTenant=null;
 const authSection=document.getElementById("auth-section");
 const authStatus=document.getElementById("auth-status");
 const authForm=document.getElementById("auth-form");
 const logoutButton=document.getElementById("logout");
+const tenantWrapper=document.getElementById("tenant-wrapper");
+const tenantSelect=document.getElementById("tenant-select");
+const tenantStatus=document.getElementById("tenant-status");
 const crudSection=document.getElementById("crud-section");
 const recordsSection=document.getElementById("records-section");
 function showLogin(){
- sessionMode=true;csrfToken=null;currentRole=null;loadVersion++;records=[];render();
+ sessionMode=true;csrfToken=null;currentRole=null;tenancyEnabled=false;activeTenant=null;loadVersion++;records=[];render();
+ tenantWrapper.hidden=true;tenantStatus.textContent="";
  authSection.hidden=false;crudSection.hidden=true;recordsSection.hidden=true;logoutButton.hidden=true;
  document.getElementById("logged-user").textContent="";
 }
@@ -162,6 +166,37 @@ function showAuthenticated(user){
  document.getElementById("logged-user").textContent=user.username+" ("+user.role+")";
  render();
 }
+function applyTenantSelection(){
+ const chosen=[...tenantSelect.options].find(option=>option.value===activeTenant);
+ currentRole=chosen?.dataset.role||null;
+ crudSection.hidden=!currentRole||currentRole==="reader";
+ recordsSection.hidden=!currentRole;
+ tenantStatus.textContent=currentRole?"":"Nenhuma empresa vinculada a esta conta.";
+ editing=null;form.reset();cancel.hidden=true;
+ document.getElementById("form-title").textContent="Novo registro";
+ records=[];loadVersion++;render();
+}
+async function configureTenants(){
+ const response=await fetch("/auth/tenants",{credentials:"same-origin",cache:"no-store"});
+ if(!response.ok)throw Error("Cannot load company memberships (HTTP "+response.status+")");
+ const data=await response.json();
+ tenancyEnabled=data.enabled===true;activeTenant=null;
+ tenantWrapper.hidden=!tenancyEnabled;
+ tenantSelect.replaceChildren();
+ if(!tenancyEnabled)return;
+ for(const company of data.tenants||[]){
+  const option=element("option",company.name+" ("+company.role+")");
+  option.value=company.id;option.dataset.role=company.role;tenantSelect.append(option);
+ }
+ if(tenantSelect.options.length)activeTenant=tenantSelect.options[0].value;
+ applyTenantSelection();
+}
+tenantSelect.addEventListener("change",()=>{
+ if(!tenancyEnabled)return;
+ activeTenant=tenantSelect.value||null;
+ applyTenantSelection();
+ if(activeTenant)resetPages();
+});
 async function initSession(){
  if(!remote){load();return;}
  try{
@@ -169,7 +204,9 @@ async function initSession(){
   if(response.status===404){load();return;}
   if(response.status===401){showLogin();return;}
   if(!response.ok)throw Error("HTTP "+response.status);
-  showAuthenticated(await response.json());load();
+  showAuthenticated(await response.json());
+  await configureTenants();
+  if(!tenancyEnabled||activeTenant)load();
  }catch(e){showLogin();authStatus.textContent="Não foi possível verificar a sessão: "+e.message;}
 }
 authForm.addEventListener("submit",async event=>{
@@ -182,7 +219,9 @@ authForm.addEventListener("submit",async event=>{
   if(response.status===401){authStatus.textContent="Usuário ou senha inválidos, ou acesso temporariamente bloqueado.";return;}
   if(!response.ok)throw Error("HTTP "+response.status);
   const user=await response.json();
-  authForm.reset();showAuthenticated(user);resetPages();
+  authForm.reset();showAuthenticated(user);
+  await configureTenants();
+  if(!tenancyEnabled||activeTenant)resetPages();
  }catch(e){authStatus.textContent="Falha no login: "+e.message;}
 });
 logoutButton.addEventListener("click",async()=>{
@@ -198,6 +237,10 @@ catch(e){status.textContent="Não foi possível ler os dados locais.";}
 function persist(){try{localStorage.setItem(key,JSON.stringify(records));return true;}catch(e){status.textContent="Erro ao salvar no armazenamento local.";return false;}}
 async function request(method,url,payload){
  const headers={"Content-Type":"application/json"};
+ if(tenancyEnabled){
+  if(!activeTenant)throw Error("Selecione uma empresa antes de acessar os dados.");
+  headers["X-RUX-TENANT"]=activeTenant;
+ }
  if(csrfToken&&method!=="GET"&&method!=="HEAD")headers["X-RUX-CSRF"]=csrfToken;
  const response=await fetch(url,{method,headers,credentials:"same-origin",cache:"no-store",
   body:payload===undefined?undefined:JSON.stringify(payload)});
@@ -209,7 +252,7 @@ async function request(method,url,payload){
  return response.json();
 }
 async function load(){
- if(!remote)return;
+ if(!remote||tenancyEnabled&&!activeTenant)return;
  const version=++loadVersion;
  const params=new URLSearchParams({limit:String(pageSize),q:document.getElementById("search").value});
  if(cursors[pageIndex]!==null)params.set("before",String(cursors[pageIndex]));
