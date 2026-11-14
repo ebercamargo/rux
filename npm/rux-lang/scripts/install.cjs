@@ -77,6 +77,11 @@ async function install() {
   }
   const source = path.join(tmp, executable);
   if (!fs.existsSync(source)) throw new Error('Missing ' + executable + ' in release archive');
+  const reportedVersion = execFileSync(source, ['--version'], { encoding: 'utf8', timeout: 10000 }).trim();
+  const expectedVersion = 'rux ' + require('../package.json').version;
+  if (reportedVersion !== expectedVersion) {
+    throw new Error('Binary version mismatch: expected ' + expectedVersion + ', got ' + reportedVersion);
+  }
   fs.mkdirSync(vendor, { recursive: true });
   fs.copyFileSync(source, path.join(vendor, executable));
   if (process.platform !== 'win32') fs.chmodSync(path.join(vendor, executable), 0o755);
