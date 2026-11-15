@@ -144,6 +144,13 @@ const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
 let csrfToken=null,sessionMode=false,currentRole=null,tenancyEnabled=false,activeTenant=null,loggedUsername="";
+let activePermissions=[];
+function can(permission){return !sessionMode||activePermissions.includes(permission);}
+function applyPermissions(){
+ crudSection.hidden=!can("records.create")&&!can("records.update");
+ recordsSection.hidden=!can("records.read");
+ render();
+}
 const authSection=document.getElementById("auth-section");
 const authStatus=document.getElementById("auth-status");
 const authForm=document.getElementById("auth-form");
@@ -154,14 +161,15 @@ const tenantStatus=document.getElementById("tenant-status");
 const crudSection=document.getElementById("crud-section");
 const recordsSection=document.getElementById("records-section");
 function showLogin(){
- sessionMode=true;csrfToken=null;currentRole=null;tenancyEnabled=false;activeTenant=null;loggedUsername="";loadVersion++;records=[];render();
+ sessionMode=true;csrfToken=null;currentRole=null;tenancyEnabled=false;activeTenant=null;loggedUsername="";activePermissions=[];loadVersion++;records=[];render();
  tenantWrapper.hidden=true;tenantStatus.textContent="";
  authSection.hidden=false;crudSection.hidden=true;recordsSection.hidden=true;logoutButton.hidden=true;
  document.getElementById("logged-user").textContent="";
 }
 function showAuthenticated(user){
  sessionMode=true;csrfToken=user.csrf;currentRole=user.role;loggedUsername=user.username;
- authSection.hidden=true;crudSection.hidden=user.role==="reader";recordsSection.hidden=false;
+ activePermissions=Array.isArray(user.permissions)?user.permissions:[];
+ authSection.hidden=true;applyPermissions();
  logoutButton.hidden=false;
  document.getElementById("logged-user").textContent=user.username+" ("+user.role+")";
  render();
@@ -169,9 +177,9 @@ function showAuthenticated(user){
 function applyTenantSelection(){
  const chosen=[...tenantSelect.options].find(option=>option.value===activeTenant);
  currentRole=chosen?.dataset.role||null;
+ activePermissions=chosen?JSON.parse(chosen.dataset.permissions||"[]"):[];
  document.getElementById("logged-user").textContent=loggedUsername+" ("+(currentRole||"sem acesso")+")";
- crudSection.hidden=!currentRole||currentRole==="reader";
- recordsSection.hidden=!currentRole;
+ applyPermissions();
  tenantStatus.textContent=currentRole?"":"Nenhuma empresa vinculada a esta conta.";
  editing=null;form.reset();cancel.hidden=true;
  document.getElementById("form-title").textContent="Novo registro";
@@ -187,7 +195,7 @@ async function configureTenants(){
  if(!tenancyEnabled)return;
  for(const company of data.tenants||[]){
   const option=element("option",company.name+" ("+company.role+")");
-  option.value=company.id;option.dataset.role=company.role;tenantSelect.append(option);
+  option.value=company.id;option.dataset.role=company.role;option.dataset.permissions=JSON.stringify(company.permissions||[]);tenantSelect.append(option);
  }
  if(tenantSelect.options.length)activeTenant=tenantSelect.options[0].value;
  applyTenantSelection();
@@ -341,10 +349,10 @@ function render(){
   const row=element("tr");for(const f of fields)row.append(element("td",String(record[f]||"")));
   const cell=element("td"),actions=element("div");actions.className="actions";
   const edit=element("button","Editar");edit.type="button";edit.className="secondary";
-  if(sessionMode&&currentRole==="reader")edit.hidden=true;
+  if(sessionMode&&!can("records.update"))edit.hidden=true;
   edit.addEventListener("click",()=>{editing=record.id;for(const f of fields)form.elements.namedItem(f).value=fieldTypes[f]==="Date"?isoDate(record[f]):record[f]||"";cancel.hidden=false;document.getElementById("form-title").textContent="Editar registro";form.scrollIntoView({behavior:"smooth"});});
   const remove=element("button","Excluir");remove.type="button";remove.className="danger";
-  if(sessionMode&&currentRole!=="admin")remove.hidden=true;
+  if(sessionMode&&!can("records.delete"))remove.hidden=true;
   remove.addEventListener("click",async()=>{if(!confirm("Excluir este registro?"))return;if(remote){try{await request("DELETE","/api/records/"+record.id);if(editing===record.id)reset();status.textContent="Registro excluído.";resetPages();}catch(e){status.textContent="Erro ao excluir: "+e.message;}return;}const previous=records;records=records.filter(r=>r.id!==record.id);if(!persist()){records=previous;return;}if(editing===record.id)reset();status.textContent="Registro excluído.";render();});
   actions.append(edit,remove);cell.append(actions);row.append(cell);body.append(row);
  }
