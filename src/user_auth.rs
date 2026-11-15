@@ -15,6 +15,7 @@ pub struct Session {
     pub user_id: String,
     pub username: String,
     pub role: String,
+    pub permissions: Vec<String>,
     pub expires_at: i64,
     pub csrf: String,
 }
@@ -47,10 +48,6 @@ fn valid_username(username: &str) -> bool {
         && username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn valid_role(role: &str) -> bool {
-    matches!(role, "reader" | "editor" | "admin")
-}
-
 pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS rux_users (
@@ -71,28 +68,37 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
              revoked_at INTEGER
          );
          CREATE INDEX IF NOT EXISTS rux_sessions_user_idx ON rux_sessions(user_id);"
-    )
+    )?;
+    let has_role: i64 = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('rux_users') WHERE name = 'policy_role'",
+        [], |row| row.get(0),
+    )?;
+    if has_role == 0 { db.execute_batch("ALTER TABLE rux_users ADD COLUMN policy_role TEXT")?; }
+    super::policy::initialize(db)
 }
 
 pub fn create_user(db: &Connection, username: &str, password: &str, role: &str) -> Result<(), String> {
     if !valid_username(username) {
         return Err("Username must be 3-64 ASCII letters, digits, '-' or '_' and start with a letter".into());
     }
-    if !valid_role(role) {
-        return Err("Role must be reader, editor, or admin".into());
-    }
+
     if !(12..=128).contains(&password.len()) {
         return Err("Password must be between 12 and 128 UTF-8 bytes".into());
     }
     initialize(db).map_err(|e| e.to_string())?;
+    if !super::policy::exists(db, role).map_err(|e| e.to_string())? {
+        return Err(format!("Unknown role '{role}'. Create it with: rux role create <project> {role}"));
+    }
     let salt = SaltString::generate(&mut OsRng);
     let password_hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|_| "Failed to hash password".to_string())?
         .to_string();
     db.execute(
-        "INSERT INTO rux_users (id,username,password_hash,role,created_at) VALUES (?1,?2,?3,?4,?5)",
-        params![uuid::Uuid::new_v4().to_string(), username, password_hash, role, unix_now()],
+        "INSERT INTO rux_users (id,username,password_hash,role,policy_role,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![uuid::Uuid::new_v4().to_string(), username, password_hash,
+            if matches!(role, "reader" | "editor" | "admin") { role } else { "reader" },
+            role, unix_now()],
     ).map_err(|e| format!("Cannot create user (username may already exist): {e}"))?;
     Ok(())
 }
@@ -106,7 +112,7 @@ pub fn login(db: &Connection, username: &str, password: &str, now: i64) -> Resul
     initialize(db).map_err(|e| e.to_string())?;
     if !valid_username(username) || password.len() > 128 { return Ok(None); }
     let info: Option<(String, String, String, i64, i64, i64)> = db.query_row(
-        "SELECT id,password_hash,role,disabled,failures,locked_until FROM rux_users WHERE username = ?1",
+        "SELECT id,password_hash,COALESCE(policy_role,role),disabled,failures,locked_until FROM rux_users WHERE username = ?1",
         params![username], |row| {
             Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))
         }
@@ -136,7 +142,9 @@ pub fn login(db: &Connection, username: &str, password: &str, now: i64) -> Resul
         params![digest(&token),user_id,now,expires_at],
     ).map_err(|e| e.to_string())?;
     Ok(Some(Login {
-        session: Session { user_id, username: username.into(), role, expires_at, csrf: csrf_for(&token) },
+        session: Session { user_id, username: username.into(),
+            permissions: super::policy::permissions(db, &role).map_err(|e| e.to_string())?,
+            role, expires_at, csrf: csrf_for(&token) },
         token,
     }))
 }
@@ -146,13 +154,16 @@ pub fn session(db: &Connection, token: &str, now: i64) -> Result<Option<Session>
         return Ok(None);
     }
     let user: Option<(String,String,String,i64)> = db.query_row(
-        "SELECT u.id,u.username,u.role,s.expires_at FROM rux_sessions s JOIN rux_users u ON u.id = s.user_id
+        "SELECT u.id,u.username,COALESCE(u.policy_role,u.role),s.expires_at FROM rux_sessions s JOIN rux_users u ON u.id = s.user_id
          WHERE s.token_hash = ?1 AND s.revoked_at IS NULL AND s.expires_at > ?2 AND u.disabled = 0",
         params![digest(token),now], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
     ).optional().map_err(|e| e.to_string())?;
-    Ok(user.map(|(user_id,username,role,expires_at)| Session {
-        user_id, username, role, expires_at, csrf: csrf_for(token),
-    }))
+    user.map(|(user_id,username,role,expires_at)| {
+        Ok(Session {
+            permissions: super::policy::permissions(db, &role).map_err(|e| e.to_string())?,
+            user_id, username, role, expires_at, csrf: csrf_for(token),
+        })
+    }).transpose()
 }
 
 pub fn csrf_matches(expected: &str, provided: &str) -> bool {
@@ -160,15 +171,6 @@ pub fn csrf_matches(expected: &str, provided: &str) -> bool {
     let mut result = 0u8;
     for (&a, &b) in expected.as_bytes().iter().zip(provided.as_bytes()) { result |= a ^ b; }
     result == 0
-}
-
-pub fn can(role: &str, operation: &str) -> bool {
-    match operation {
-        "GET" | "HEAD" => valid_role(role),
-        "POST" | "PUT" | "PATCH" => matches!(role, "editor" | "admin"),
-        "DELETE" | "METRICS" => role == "admin",
-        _ => false,
-    }
 }
 
 pub fn logout(db: &Connection, token: &str) -> Result<(), String> {
@@ -191,7 +193,7 @@ pub fn disable(db: &Connection, username: &str) -> Result<bool, String> {
 
 pub fn list(db: &Connection) -> Result<Vec<(String,String,bool)>, String> {
     initialize(db).map_err(|e| e.to_string())?;
-    let mut stmt = db.prepare("SELECT username,role,disabled FROM rux_users ORDER BY username").map_err(|e| e.to_string())?;
+    let mut stmt = db.prepare("SELECT username,COALESCE(policy_role,role),disabled FROM rux_users ORDER BY username").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get::<_,i64>(2)? != 0)))
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
@@ -218,6 +220,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn accepts_custom_roles_without_implicit_permissions() {
+        let db = Connection::open_in_memory().unwrap();
+        super::super::policy::create(&db,"doctor").unwrap();
+        create_user(&db,"dr_alice","secure-long-password","doctor").unwrap();
+        let session = login(&db,"dr_alice","secure-long-password",1000)
+            .unwrap().unwrap().session;
+        assert_eq!(session.role,"doctor");
+        assert!(session.permissions.is_empty());
+        super::super::policy::allow(&db,"doctor","patients.read").unwrap();
+        let new_login = login(&db,"dr_alice","secure-long-password",1001)
+            .unwrap().unwrap().session;
+        assert_eq!(new_login.permissions,vec!["patients.read".to_owned()]);
+    }
+    #[test]
     fn login_sessions_expire_and_logout_revokes() {
         let db = Connection::open_in_memory().unwrap();
         create_user(&db, "alice", "a reasonably long secret!", "reader").unwrap();
@@ -230,9 +246,9 @@ mod tests {
         assert_eq!(active.role,"reader");
         assert_eq!(active.user_id,auth.session.user_id);
         assert!(!active.user_id.is_empty());
-        assert!(can(&active.role,"GET"));
-        assert!(!can(&active.role,"POST"));
-        assert!(!can(&active.role,"DELETE"));
+        assert!(active.permissions.contains(&"records.read".to_owned()));
+        assert!(!active.permissions.contains(&"records.create".to_owned()));
+        assert!(!active.permissions.contains(&"records.delete".to_owned()));
         assert!(csrf_matches(&active.csrf,&auth.session.csrf));
         assert!(!csrf_matches(&active.csrf,"incorrect"));
         assert!(session(&db,&auth.token,1000 + SESSION_SECONDS).unwrap().is_none());
@@ -262,7 +278,7 @@ mod tests {
         assert!(login(&db,"diana","even-longer-password",101).unwrap().is_none());
         assert_eq!(enabled_count(&db).unwrap(),0);
         assert!(!disable(&db,"diana").unwrap());
-        assert!(!can("editor","METRICS"));
-        assert!(can("admin","METRICS"));
+        assert!(!super::super::policy::operation_allowed(&db,"editor","METRICS").unwrap());
+        assert!(super::super::policy::operation_allowed(&db,"admin","METRICS").unwrap());
     }
 }
