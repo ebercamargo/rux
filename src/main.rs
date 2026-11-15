@@ -62,23 +62,22 @@ fn execute_file(command: &str, path: &str) {
         process::exit(1);
     });
     if source.lines().any(|line| line.trim_start().starts_with("data ")) {
-        let (name, _) = rux::crud_schema::parse_typed_schema(&source).unwrap_or_else(|error| {
+        let (name, fields, security) = rux::crud_schema::parse_typed_app(&source).unwrap_or_else(|error| {
             eprintln!("RUX schema error: {error}");
             process::exit(1);
         });
         if command == "check" {
             println!("Schema OK: {path}");
+            if let Some(policy) = security.as_ref() {
+                println!("Security OK: {} role(s), {} route requirement(s)", policy.roles.len(), policy.routes.len());
+            }
             return;
         }
-        let (_, fields) = rux::crud_schema::parse_typed_schema(&source).unwrap_or_else(|error| {
-            eprintln!("RUX schema error: {error}");
-            process::exit(1);
-        });
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap_or_else(|error| {
             eprintln!("cannot initialize runtime: {error}");
             process::exit(1);
         });
-        if let Err(error) = runtime.block_on(rux::native_crud::serve(&name, fields)) {
+        if let Err(error) = runtime.block_on(rux::native_crud::serve_with_security(&name, fields, security)) {
             eprintln!("RUX native CRUD error: {error}");
             process::exit(1);
         }
