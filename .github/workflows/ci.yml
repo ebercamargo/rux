@@ -395,3 +395,66 @@ jobs:
           done
           curl -fsS "$url/api/records" > ci-tenant-legacy-visible.json
           python3 -c 'import json; assert json.load(open("ci-tenant-legacy-visible.json"))==[]'
+
+      - name: Custom roles, zero default privileges and immediate policy revocation
+        run: |
+          set -euo pipefail
+          cat > ci_policy.rux <<'RUX'
+          app CiPolicy {
+              data Customer {
+                  name: Text
+              }
+          }
+          RUX
+          PORT=3600 cargo run --quiet -- run ci_policy.rux > ci-policy-seed.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3600/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:3600/health/ready >/dev/null
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          trap - EXIT
+          cargo run --quiet -- role create CiPolicy auditor_custom
+          cargo run --quiet -- role allow CiPolicy auditor_custom records.read
+          cargo run --quiet -- role create CiPolicy integration_custom
+          cargo run --quiet -- role allow CiPolicy integration_custom records.read
+          cargo run --quiet -- role list CiPolicy | grep -q auditor_custom
+          printf '%s\n' 'test-only-secure-password-123' |
+            cargo run --quiet -- user create CiPolicy auditor_one auditor_custom --password-stdin
+          umask 077
+          cargo run --quiet -- identity create CiPolicy app_connector integration_custom > ci-policy-token.txt
+          token=$(sed -n 's/^API token (displayed once; store securely): //p' ci-policy-token.txt)
+          RUX_AUTH_MODE=users PORT=3600 cargo run --quiet -- run ci_policy.rux > ci-policy-server.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; rm -f ci-policy-*.json ci-policy-*.cookies ci-policy-token.txt' EXIT
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3600/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          url=http://127.0.0.1:3600
+          curl -fsS -c ci-policy-auditor.cookies -H 'Content-Type: application/json' \
+            -d '{"username":"auditor_one","password":"test-only-secure-password-123"}' \
+            "$url/auth/login" > ci-policy-login.json
+          csrf=$(python3 -c 'import json; print(json.load(open("ci-policy-login.json"))["csrf"])')
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-policy-auditor.cookies "$url/api/records")" = "200"
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-policy-auditor.cookies -H "X-RUX-CSRF: $csrf" \
+            -H 'Content-Type: application/json' -d '{"name":"Denied"}' "$url/api/records")" = "403"
+          cargo run --quiet -- role allow CiPolicy auditor_custom records.create
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-policy-auditor.cookies -H "X-RUX-CSRF: $csrf" \
+            -H 'Content-Type: application/json' -d '{"name":"Allowed"}' "$url/api/records")" = "201"
+          cargo run --quiet -- role deny CiPolicy auditor_custom records.read
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -b ci-policy-auditor.cookies "$url/api/records")" = "403"
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          RUX_AUTH_MODE=identities PORT=3600 cargo run --quiet -- run ci_policy.rux > ci-policy-identity.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3600/health/ready >/dev/null; then break; fi
+            sleep 1
+          done
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$url/api/records")" = "200"
+          cargo run --quiet -- role deny CiPolicy integration_custom records.read
+          test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "$url/api/records")" = "403"
