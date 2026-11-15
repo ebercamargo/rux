@@ -260,22 +260,26 @@ fn project_check(path: &str) {
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity, user, tenant");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity, user, tenant, role");
     println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
     println!("  secret generate  Generate a random API secret (keep it private)");
-    println!("  identity create <project> <name> <reader|editor|admin>  Create API identity");
+    println!("  identity create <project> <name> <role>     Create API identity");
     println!("  identity list <project>                         List identities (no secrets)");
     println!("  identity revoke <project> <name>                Revoke API identity");
-    println!("  user create <project> <name> <reader|editor|admin>  Create login user (password prompt)");
+    println!("  user create <project> <name> <role>              Create login user (password prompt)");
     println!("  user create <project> <name> <role> --password-stdin  Read password from stdin");
     println!("  user list <project>                            List login users");
     println!("  user disable <project> <name>                  Disable login user and sessions");
     println!("  tenant create <project> <slug> <name>          Create tenant (quote names with spaces)");
-    println!("  tenant grant <project> <slug> <user> <role>    Set tenant-specific reader/editor/admin role");
+    println!("  tenant grant <project> <slug> <user> <role>    Set any tenant-specific role");
     println!("  tenant revoke <project> <slug> <user>          Revoke membership");
     println!("  tenant list <project>                          List tenants");
+    println!("  role create <project> <name>                   Create a role with no privileges");
+    println!("  role allow <project> <name> <resource.action>  Assign an explicit permission");
+    println!("  role deny <project> <name> <resource.action>   Remove a permission");
+    println!("  role list <project>                            List roles and permissions");
     println!("  --version        Print version");
     println!("  --help           Show this help");
 }
@@ -377,6 +381,33 @@ fn main() {
                     println!("{slug} | {name} | {}", if active { "ACTIVE" } else { "DISABLED" });
                 },
                 Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
+            }
+        }
+        [_, command, operation, project, name] if command == "role" && operation == "create" => {
+            match rux::policy::create_in_project(Path::new(project), name) {
+                Ok(()) => println!("Role created without permissions: {name}"),
+                Err(error) => { eprintln!("RUX policy error: {error}"); process::exit(1); }
+            }
+        }
+        [_, command, operation, project, name, permission] if command == "role" && operation == "allow" => {
+            match rux::policy::allow_in_project(Path::new(project), name, permission) {
+                Ok(()) => println!("Permission granted: {name} -> {permission}"),
+                Err(error) => { eprintln!("RUX policy error: {error}"); process::exit(1); }
+            }
+        }
+        [_, command, operation, project, name, permission] if command == "role" && operation == "deny" => {
+            match rux::policy::deny_in_project(Path::new(project), name, permission) {
+                Ok(true) => println!("Permission revoked: {name} -> {permission}"),
+                Ok(false) => { eprintln!("Permission was not assigned: {name} -> {permission}"); process::exit(1); }
+                Err(error) => { eprintln!("RUX policy error: {error}"); process::exit(1); }
+            }
+        }
+        [_, command, operation, project] if command == "role" && operation == "list" => {
+            match rux::policy::list_in_project(Path::new(project)) {
+                Ok(roles) => for (role, grants) in roles {
+                    println!("{role}: {}", if grants.is_empty() { "(no permissions)".into() } else { grants.join(", ") });
+                },
+                Err(error) => { eprintln!("RUX policy error: {error}"); process::exit(1); }
             }
         }
         [_, flag] if flag == "--help" || flag == "-h" || flag == "help" => help(),
