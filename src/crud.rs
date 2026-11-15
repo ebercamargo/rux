@@ -144,8 +144,11 @@ const head=document.getElementById("table-head");
 const status=document.getElementById("status");
 let editing=null;
 let csrfToken=null,sessionMode=false,currentRole=null,tenancyEnabled=false,activeTenant=null,loggedUsername="";
-let activePermissions=[];
-function can(permission){return !sessionMode||activePermissions.includes(permission);}
+let activePermissions=[],crudPolicy={};
+function can(permission){
+ const required=crudPolicy[permission]||permission;
+ return !sessionMode||activePermissions.includes(required);
+}
 function applyPermissions(){
  crudSection.hidden=!can("records.create")&&!can("records.update");
  recordsSection.hidden=!can("records.read");
@@ -169,6 +172,7 @@ function showLogin(){
 function showAuthenticated(user){
  sessionMode=true;csrfToken=user.csrf;currentRole=user.role;loggedUsername=user.username;
  activePermissions=Array.isArray(user.permissions)?user.permissions:[];
+ crudPolicy=user.crudPolicy||{};
  authSection.hidden=true;applyPermissions();
  logoutButton.hidden=false;
  document.getElementById("logged-user").textContent=user.username+" ("+user.role+")";
