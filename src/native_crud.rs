@@ -265,8 +265,11 @@ async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str, c
     -> Result<super::user_auth::Session, StatusCode>
 {
     let (_, session) = browser_session(state, headers).await?;
-    if check_global_role && !super::user_auth::can(&session.role, operation) {
-        return Err(StatusCode::FORBIDDEN);
+    if check_global_role {
+        let permission = super::policy::operation_permission(operation).ok_or(StatusCode::FORBIDDEN)?;
+        if !session.permissions.iter().any(|allowed| allowed == permission) {
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
     if !matches!(operation, "GET" | "HEAD" | "METRICS") {
         let csrf = headers.get("x-rux-csrf").and_then(|header| header.to_str().ok())
@@ -308,6 +311,7 @@ async fn browser_login(State(state): State<AppState>, Json(form): Json<LoginForm
     Ok((headers, Json(json!({
         "username": login.session.username,
         "role": login.session.role,
+        "permissions": login.session.permissions,
         "expiresAt": login.session.expires_at,
         "csrf": login.session.csrf,
     }))))
@@ -318,6 +322,7 @@ async fn browser_me(State(state): State<AppState>, headers: HeaderMap) -> Result
     let (_, session) = browser_session(&state, &headers).await?;
     Ok(Json(json!({
         "username": session.username, "role": session.role,
+        "permissions": session.permissions,
         "expiresAt": session.expires_at, "csrf": session.csrf
     })))
 }
@@ -447,7 +452,9 @@ async fn limit_api(State(state): State<AppState>, mut request: Request, next: Ne
                         .and_then(|header| header.to_str().ok())
                         .ok_or(StatusCode::BAD_REQUEST)?;
                     let membership = verified_tenant(&state, &principal.user_id, requested_tenant).await?;
-                    if !super::user_auth::can(&membership.role, &operation) {
+                    let permission = super::policy::operation_permission(&operation)
+                        .ok_or(StatusCode::FORBIDDEN)?;
+                    if !membership.permissions.iter().any(|allowed| allowed == permission) {
                         return Err(StatusCode::FORBIDDEN);
                     }
                     request.extensions_mut().insert(TenantContext { id: membership.id });
@@ -571,7 +578,7 @@ fn record_access(auth_mode: AuthMode, principal: Option<Extension<super::user_au
                     scope: 3, owner_id: Some(user.user_id), tenant_id: Some(tenant_id),
                 });
             }
-            let scope = if user.role == "admin" { 2 } else { 1 };
+            let scope = if user.permissions.iter().any(|p| p == "records.access_all") { 2 } else { 1 };
             Ok(RecordAccess {
                 scope, owner_id: Some(user.user_id), tenant_id: None,
             })
@@ -1096,6 +1103,7 @@ mod tests {
         }
         let user = crate::user_auth::Session {
             user_id: "user-a".into(), username: "alice".into(), role: "admin".into(),
+            permissions: vec!["records.access_all".into()],
             expires_at: 1000, csrf: "test".into(),
         };
         let local_admin = record_access(AuthMode::Users, Some(Extension(user.clone())), None, false).unwrap();
@@ -1148,6 +1156,7 @@ mod tests {
 
         let alice = crate::user_auth::Session {
             user_id: "user-a".into(), username: "alice".into(), role: "editor".into(),
+            permissions: vec!["records.read".into(), "records.create".into(), "records.update".into()],
             expires_at: 1000, csrf: "test".into(),
         };
         let editor = record_access(AuthMode::Users, Some(Extension(alice)), None, false).unwrap();
