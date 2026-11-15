@@ -83,6 +83,13 @@ pub fn list(db: &Connection) -> Result<Vec<(String, String, bool)>, String> {
 }
 
 pub fn authorize(db: &Connection, header: Option<&str>, operation: &str) -> rusqlite::Result<Decision> {
+    let Some(permission) = super::policy::operation_permission(operation) else {
+        return Ok(Decision::Forbidden);
+    };
+    authorize_permission(db, header, permission)
+}
+
+pub fn authorize_permission(db: &Connection, header: Option<&str>, permission: &str) -> rusqlite::Result<Decision> {
     let Some(token) = header.and_then(|header| header.strip_prefix("Bearer ")) else {
         return Ok(Decision::Unauthenticated);
     };
@@ -96,7 +103,7 @@ pub fn authorize(db: &Connection, header: Option<&str>, operation: &str) -> rusq
         |row| row.get(0),
     ).optional()?;
     let Some(role) = role else { return Ok(Decision::Unauthenticated); };
-    let permitted = super::policy::operation_allowed(db, &role, operation)?;
+    let permitted = super::policy::role_allows(db, &role, permission)?;
     Ok(if permitted { Decision::Allowed } else { Decision::Forbidden })
 }
 
@@ -125,6 +132,17 @@ pub fn list_in_project(project: &Path) -> Result<Vec<(String, String, bool)>, St
 mod tests {
     use super::*;
 
+    #[test]
+    fn identity_route_binding_requires_explicit_permission() {
+        let db = Connection::open_in_memory().unwrap();
+        super::super::policy::create(&db, "consultant").unwrap();
+        let token = create(&db, "consultant_api", "consultant").unwrap();
+        let bearer = format!("Bearer {token}");
+        assert_eq!(authorize_permission(&db, Some(&bearer), "records.read").unwrap(), Decision::Forbidden);
+        super::super::policy::allow(&db, "consultant", "patients.read").unwrap();
+        assert_eq!(authorize_permission(&db, Some(&bearer), "patients.read").unwrap(), Decision::Allowed);
+        assert_eq!(authorize_permission(&db, Some(&bearer), "records.read").unwrap(), Decision::Forbidden);
+    }
     #[test]
     fn api_identities_support_custom_roles_and_permissions() {
         let db=Connection::open_in_memory().unwrap();
