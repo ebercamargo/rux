@@ -1,0 +1,18 @@
+app SecurityExample {
+    data Customer {
+        name: Text
+        email: Email
+    }
+    security {
+        role physician {
+            allow patients.read
+            allow patients.update
+        }
+        route GET "/api/records" {
+            require patients.read
+        }
+        route PUT "/api/records/{id}" {
+            require patients.update
+        }
+    }
+}
