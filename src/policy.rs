@@ -81,6 +81,60 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Synchronizes source-managed roles exactly as declared by the RUX program.
+/// Roles not declared in the current source lose all source-managed privileges,
+/// but identities, memberships and the role names themselves are retained.
+pub fn sync_source_roles(
+    db: &mut Connection,
+    spec: Option<&super::security_schema::SecuritySpec>,
+) -> Result<(), String> {
+    initialize(db).map_err(|error| error.to_string())?;
+    let tx = db.transaction().map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rux_source_roles (
+            role_name TEXT PRIMARY KEY REFERENCES rux_roles(name)
+        );",
+    ).map_err(|error| error.to_string())?;
+
+    let prior_roles: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT role_name FROM rux_source_roles")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| error.to_string())?
+    };
+    let declared = spec.map(|spec| spec.roles.as_slice()).unwrap_or(&[]);
+    for role in prior_roles {
+        if !declared.iter().any(|entry| entry.name == role) {
+            tx.execute("DELETE FROM rux_role_permissions WHERE role_name = ?1", params![role])
+                .map_err(|error| error.to_string())?;
+            tx.execute("DELETE FROM rux_source_roles WHERE role_name = ?1", params![role])
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for entry in declared {
+        if !valid_role_name(&entry.name) || entry.permissions.iter().any(|p| !valid_permission(p)) {
+            return Err(format!("Invalid source-defined role policy: {}", entry.name));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO rux_roles(name,created_at) VALUES (?1,?2)",
+            params![entry.name, super::user_auth::unix_now()],
+        ).map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM rux_role_permissions WHERE role_name = ?1", params![entry.name])
+            .map_err(|error| error.to_string())?;
+        for permission in &entry.permissions {
+            tx.execute(
+                "INSERT INTO rux_role_permissions(role_name,permission) VALUES (?1,?2)",
+                params![entry.name, permission],
+            ).map_err(|error| error.to_string())?;
+        }
+        tx.execute("INSERT OR IGNORE INTO rux_source_roles(role_name) VALUES (?1)", params![entry.name])
+            .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
 pub fn exists(db: &Connection, role: &str) -> rusqlite::Result<bool> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM rux_roles WHERE name = ?1)",
         params![role], |row| row.get(0))
@@ -182,6 +236,26 @@ pub fn list_in_project(project: &Path) -> Result<Vec<(String,Vec<String>)>,Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_policy_grants_are_reproducible_and_revoked_when_removed() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let spec = super::super::security_schema::SecuritySpec {
+            roles: vec![super::super::security_schema::RoleDeclaration {
+                name: "physician".into(), permissions: vec!["patients.read".into()],
+            }],
+            routes: Vec::new(),
+        };
+        sync_source_roles(&mut db, Some(&spec)).unwrap();
+        assert!(role_allows(&db,"physician","patients.read").unwrap());
+        assert!(!role_allows(&db,"physician","patients.write").unwrap());
+        allow(&db,"physician","patients.write").unwrap();
+        sync_source_roles(&mut db,Some(&spec)).unwrap();
+        assert!(!role_allows(&db,"physician","patients.write").unwrap());
+        sync_source_roles(&mut db,None).unwrap();
+        assert!(!role_allows(&db,"physician","patients.read").unwrap());
+        assert!(exists(&db,"physician").unwrap());
+    }
 
     #[test]
     fn roles_are_user_defined_and_permissions_are_explicit() {
