@@ -9,16 +9,13 @@ pub struct Membership {
     pub slug: String,
     pub name: String,
     pub role: String,
+    pub permissions: Vec<String>,
 }
 
 fn valid_slug(value: &str) -> bool {
     (2..=64).contains(&value.len())
         && value.starts_with(|ch: char| ch.is_ascii_lowercase())
         && value.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-}
-
-fn valid_role(role: &str) -> bool {
-    matches!(role, "reader" | "editor" | "admin")
 }
 
 pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
@@ -38,7 +35,13 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY(tenant_id,user_id)
         );
         CREATE INDEX IF NOT EXISTS rux_tenant_memberships_user_idx ON rux_tenant_memberships(user_id);"
-    )
+    )?;
+    let has_role: i64 = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('rux_tenant_memberships') WHERE name = 'policy_role'",
+        [], |row| row.get(0),
+    )?;
+    if has_role == 0 { db.execute_batch("ALTER TABLE rux_tenant_memberships ADD COLUMN policy_role TEXT")?; }
+    super::policy::initialize(db)
 }
 
 pub fn create(db: &Connection, slug: &str, name: &str) -> Result<String, String> {
@@ -58,8 +61,10 @@ pub fn create(db: &Connection, slug: &str, name: &str) -> Result<String, String>
 }
 
 pub fn grant(db: &Connection, slug: &str, username: &str, role: &str) -> Result<(), String> {
-    if !valid_role(role) { return Err("Tenant role must be reader, editor, or admin".into()); }
     initialize(db).map_err(|e| e.to_string())?;
+    if !super::policy::exists(db,role).map_err(|e| e.to_string())? {
+        return Err(format!("Unknown role '{role}'. Create it with: rux role create <project> {role}"));
+    }
     let tenant_id: String = db.query_row("SELECT id FROM rux_tenants WHERE slug = ?1 AND active = 1",
         params![slug], |row| row.get(0)).optional()
         .map_err(|e| e.to_string())?
@@ -69,10 +74,13 @@ pub fn grant(db: &Connection, slug: &str, username: &str, role: &str) -> Result<
         .map_err(|e| e.to_string())?
         .ok_or("Active user not found")?;
     db.execute(
-        "INSERT INTO rux_tenant_memberships (tenant_id,user_id,role,revoked_at)
-         VALUES (?1,?2,?3,NULL)
-         ON CONFLICT(tenant_id,user_id) DO UPDATE SET role=excluded.role, revoked_at=NULL",
-        params![tenant_id,user_id,role],
+        "INSERT INTO rux_tenant_memberships (tenant_id,user_id,role,policy_role,revoked_at)
+         VALUES (?1,?2,?3,?4,NULL)
+         ON CONFLICT(tenant_id,user_id) DO UPDATE SET
+            role=excluded.role, policy_role=excluded.policy_role, revoked_at=NULL",
+        params![tenant_id,user_id,
+            if matches!(role,"reader"|"editor"|"admin") { role } else { "reader" },
+            role],
     ).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -91,7 +99,7 @@ pub fn revoke(db: &Connection, slug: &str, username: &str) -> Result<bool, Strin
 
 pub fn memberships(db: &Connection, user_id: &str) -> rusqlite::Result<Vec<Membership>> {
     let mut stmt = db.prepare(
-        "SELECT t.id,t.slug,t.name,m.role
+        "SELECT t.id,t.slug,t.name,COALESCE(m.policy_role,m.role)
          FROM rux_tenant_memberships m
          JOIN rux_tenants t ON t.id = m.tenant_id
          JOIN rux_users u ON u.id = m.user_id
@@ -100,8 +108,13 @@ pub fn memberships(db: &Connection, user_id: &str) -> rusqlite::Result<Vec<Membe
     )?;
     let rows = stmt.query_map(params![user_id], |row| Ok(Membership {
         id: row.get(0)?, slug: row.get(1)?, name: row.get(2)?, role: row.get(3)?,
+        permissions: Vec::new(),
     }))?;
-    rows.collect()
+    let mut memberships = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    for member in &mut memberships {
+        member.permissions = super::policy::permissions(db, &member.role)?;
+    }
+    Ok(memberships)
 }
 
 pub fn membership(db: &Connection, user_id: &str, tenant_id: &str) -> rusqlite::Result<Option<Membership>> {
@@ -113,8 +126,16 @@ pub fn membership(db: &Connection, user_id: &str, tenant_id: &str) -> rusqlite::
          WHERE m.user_id = ?1 AND t.id = ?2
            AND m.revoked_at IS NULL AND t.active = 1 AND u.disabled = 0",
         params![user_id,tenant_id],
-        |row| Ok(Membership { id:row.get(0)?, slug:row.get(1)?, name:row.get(2)?, role:row.get(3)? })
-    ).optional()
+        |row| Ok(Membership {
+            id:row.get(0)?, slug:row.get(1)?, name:row.get(2)?, role:row.get(3)?,
+            permissions: Vec::new(),
+        })
+    ).optional().and_then(|membership| {
+        membership.map(|mut member| {
+            member.permissions = super::policy::permissions(db, &member.role)?;
+            Ok(member)
+        }).transpose()
+    })
 }
 
 pub fn active_count(db: &Connection) -> rusqlite::Result<i64> {
@@ -161,6 +182,21 @@ pub fn list_in_project(project: &Path) -> Result<Vec<(String,String,bool)>,Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn arbitrary_role_grants_are_tenant_specific() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        super::super::policy::create(&db,"physician").unwrap();
+        super::super::policy::allow(&db,"physician","patients.read").unwrap();
+        crate::user_auth::create_user(&db,"med_user","long-secure-password","physician").unwrap();
+        let a = create(&db,"hospital-a","Hospital A").unwrap();
+        let b = create(&db,"hospital-b","Hospital B").unwrap();
+        grant(&db,"hospital-a","med_user","physician").unwrap();
+        let id:String=db.query_row("SELECT id FROM rux_users WHERE username='med_user'",[],|row|row.get(0)).unwrap();
+        assert_eq!(membership(&db,&id,&a).unwrap().unwrap().role,"physician");
+        assert!(membership(&db,&id,&a).unwrap().unwrap().permissions.contains(&"patients.read".into()));
+        assert!(membership(&db,&id,&b).unwrap().is_none());
+    }
     #[test]
     fn membership_is_tenant_scoped_even_for_global_admins() {
         let db = Connection::open_in_memory().unwrap();
