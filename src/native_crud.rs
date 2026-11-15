@@ -31,6 +31,7 @@ struct AppState {
     api_token: Option<Arc<String>>,
     read_token: Option<Arc<String>>,
     auth_mode: AuthMode,
+    route_permissions: Arc<HashMap<(String, String), String>>,
     tenancy_enabled: bool,
     secure_cookie: bool,
     allowed_hosts: Arc<Vec<String>>,
@@ -261,12 +262,35 @@ async fn browser_session(state: &AppState, headers: &HeaderMap)
     Ok((token, session.ok_or(StatusCode::UNAUTHORIZED)?))
 }
 
-async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str, check_global_role: bool)
+fn required_crud_permission(state: &AppState, operation: &str, path: &str) -> Option<String> {
+    let method = if operation == "HEAD" { "GET" } else { operation };
+    let route = match (method, path) {
+        ("GET" | "POST", "/api/records") => "/api/records",
+        ("PUT" | "DELETE", path)
+            if path.strip_prefix("/api/records/").is_some_and(|id| !id.is_empty() && !id.contains('/')) =>
+            "/api/records/{id}",
+        _ => return None,
+    };
+    state.route_permissions
+        .get(&(method.to_owned(), route.to_owned()))
+        .cloned()
+        .or_else(|| super::policy::operation_permission(method).map(str::to_owned))
+}
+
+fn browser_crud_permissions(state: &AppState) -> Value {
+    json!({
+        "records.read": required_crud_permission(state, "GET", "/api/records"),
+        "records.create": required_crud_permission(state, "POST", "/api/records"),
+        "records.update": required_crud_permission(state, "PUT", "/api/records/record-id"),
+        "records.delete": required_crud_permission(state, "DELETE", "/api/records/record-id")
+    })
+}
+
+async fn check_browser(state: &AppState, headers: &HeaderMap, operation: &str, permission: &str, check_global_role: bool)
     -> Result<super::user_auth::Session, StatusCode>
 {
     let (_, session) = browser_session(state, headers).await?;
     if check_global_role {
-        let permission = super::policy::operation_permission(operation).ok_or(StatusCode::FORBIDDEN)?;
         if !session.permissions.iter().any(|allowed| allowed == permission) {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -312,6 +336,7 @@ async fn browser_login(State(state): State<AppState>, Json(form): Json<LoginForm
         "username": login.session.username,
         "role": login.session.role,
         "permissions": login.session.permissions,
+        "crudPolicy": browser_crud_permissions(&state),
         "expiresAt": login.session.expires_at,
         "csrf": login.session.csrf,
     }))))
@@ -323,6 +348,7 @@ async fn browser_me(State(state): State<AppState>, headers: HeaderMap) -> Result
     Ok(Json(json!({
         "username": session.username, "role": session.role,
         "permissions": session.permissions,
+        "crudPolicy": browser_crud_permissions(&state),
         "expiresAt": session.expires_at, "csrf": session.csrf
     })))
 }
@@ -349,14 +375,14 @@ async fn browser_logout(State(state): State<AppState>, headers: HeaderMap)
     Ok((response_headers, Json(json!({"loggedOut":true}))))
 }
 
-async fn check_identity(state: &AppState, authorization: Option<&str>, operation: &str) -> Result<(), StatusCode> {
+async fn check_identity(state: &AppState, authorization: Option<&str>, permission: &str) -> Result<(), StatusCode> {
     let _db_permit = acquire_db(state).await?;
     let pool = state.db.clone();
     let bearer = authorization.map(str::to_owned);
-    let operation = operation.to_owned();
+    let permission = permission.to_owned();
     let decision = tokio::task::spawn_blocking(move || {
         let db = pool.get().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        super::identity::authorize(&db, bearer.as_deref(), &operation)
+        super::identity::authorize_permission(&db, bearer.as_deref(), &permission)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
     match decision {
@@ -438,23 +464,23 @@ async fn limit_api(State(state): State<AppState>, mut request: Request, next: Ne
         let authorization = auth_headers.get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok()).map(str::to_owned);
         let operation = request.method().as_str().to_owned();
+        let required_permission = required_crud_permission(&state, &operation, request.uri().path())
+            .ok_or(StatusCode::FORBIDDEN)?;
         match state.auth_mode {
             AuthMode::Legacy => {
                 if !authorize_api(request.method(), authorization.as_deref(), state.api_token.as_deref().map(String::as_str), state.read_token.as_deref().map(String::as_str)) {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
             }
-            AuthMode::Identities => check_identity(&state, authorization.as_deref(), &operation).await?,
+            AuthMode::Identities => check_identity(&state, authorization.as_deref(), &required_permission).await?,
             AuthMode::Users => {
-                let principal = check_browser(&state, &auth_headers, &operation, !state.tenancy_enabled).await?;
+                let principal = check_browser(&state, &auth_headers, &operation, &required_permission, !state.tenancy_enabled).await?;
                 if state.tenancy_enabled {
                     let requested_tenant = auth_headers.get("x-rux-tenant")
                         .and_then(|header| header.to_str().ok())
                         .ok_or(StatusCode::BAD_REQUEST)?;
                     let membership = verified_tenant(&state, &principal.user_id, requested_tenant).await?;
-                    let permission = super::policy::operation_permission(&operation)
-                        .ok_or(StatusCode::FORBIDDEN)?;
-                    if !membership.permissions.iter().any(|allowed| allowed == permission) {
+                    if !membership.permissions.iter().any(|allowed| allowed == &required_permission) {
                         return Err(StatusCode::FORBIDDEN);
                     }
                     request.extensions_mut().insert(TenantContext { id: membership.id });
@@ -474,9 +500,9 @@ async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Result<Js
     let bearer = headers.get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     match state.auth_mode {
-        AuthMode::Identities => check_identity(&state, bearer, "METRICS").await?,
+        AuthMode::Identities => check_identity(&state, bearer, "metrics.read").await?,
         AuthMode::Users if state.tenancy_enabled => return Err(StatusCode::FORBIDDEN),
-        AuthMode::Users => { check_browser(&state, &headers, "METRICS", true).await?; },
+        AuthMode::Users => { check_browser(&state, &headers, "METRICS", "metrics.read", true).await?; },
         AuthMode::Legacy => {
             let authorized = state.api_token.as_deref()
                 .is_some_and(|expected| bearer.is_some_and(|value| token_matches(value, expected)));
@@ -701,6 +727,15 @@ async fn delete(State(state): State<AppState>, RoutePath(id): RoutePath<String>,
 }
 
 pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), String> {
+    serve_with_security(name, fields, None).await
+}
+
+pub async fn serve_with_security(
+    name: &str,
+    fields: Vec<(String, String)>,
+    security: Option<super::security_schema::SecuritySpec>,
+) -> Result<(), String> {
+    let route_permissions = security.as_ref().map(|rules| rules.route_permissions()).unwrap_or_default();
     super::database::selected_backend(std::env::var("RUX_DATABASE_URL").ok().as_deref())
         .map_err(|error| format!("RUX_DATABASE_URL: {error}"))?;
     let directory = Path::new(name);
@@ -724,7 +759,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     }
     let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
     {
-        let connection = db.get().map_err(|e| e.to_string())?;
+        let mut connection = db.get().map_err(|e| e.to_string())?;
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (
             id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT, tenant_id TEXT);")
             .map_err(|e| e.to_string())?;
@@ -751,6 +786,8 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
         super::user_auth::initialize(&connection).map_err(|e| e.to_string())?;
         super::tenant::initialize(&connection).map_err(|e| e.to_string())?;
+        super::policy::sync_source_roles(&mut connection, security.as_ref())
+            .map_err(|error| format!("Cannot apply RUX security declarations: {error}"))?;
     }
     let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "120".into())
@@ -790,6 +827,9 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     validate_network_exposure(address.ip(), std::env::var("RUX_ALLOW_UNAUTHENTICATED_REMOTE").ok().as_deref())?;
     let allowed_hosts = allowed_host_names(address.ip(), std::env::var("RUX_ALLOWED_HOSTS").ok().as_deref())?;
     let auth_mode = AuthMode::parse(&std::env::var("RUX_AUTH_MODE").unwrap_or_else(|_| "legacy".into()))?;
+    if auth_mode == AuthMode::Legacy && !route_permissions.is_empty() {
+        return Err("Explicit security route requirements require RUX_AUTH_MODE=users or identities; legacy shared-token mode cannot evaluate custom role permissions".into());
+    }
     let tenancy_enabled = match std::env::var("RUX_TENANCY") {
         Ok(value) if value == "enabled" => true,
         Ok(value) if value == "disabled" => false,
@@ -854,7 +894,7 @@ pub async fn serve(name: &str, fields: Vec<(String, String)>) -> Result<(), Stri
     }
     let secure_cookie = environment == "production" || !address.ip().is_loopback();
     let accepting = Arc::new(AtomicBool::new(true));
-    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), csp_header: Arc::new(csp_header), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, tenancy_enabled, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
+    let state = AppState { db, fields: Arc::new(fields), html: Arc::new(html), manifest: Arc::new(manifest_content), csp_header: Arc::new(csp_header), api_token: api_token.map(Arc::new), read_token: read_token.map(Arc::new), auth_mode, route_permissions: Arc::new(route_permissions), tenancy_enabled, secure_cookie, allowed_hosts: Arc::new(allowed_hosts), rate_windows: Arc::new(Mutex::new(HashMap::new())), rate_limit_per_minute, accepting: Arc::clone(&accepting), api_slots: Arc::new(Semaphore::new(max_requests)), waiting_slots: Arc::new(Semaphore::new(max_waiting)), api_wait: Duration::from_millis(wait_ms), db_slots: Arc::new(Semaphore::new(pool_size as usize)), db_wait: Duration::from_millis(db_wait_ms), requests_total: Arc::new(AtomicU64::new(0)), rejected_total: Arc::new(AtomicU64::new(0)), request_duration_micros: Arc::new(AtomicU64::new(0)) };
     let state_for_rate = state.clone();
     let state_for_host = state.clone();
     let state_for_security = state.clone();
@@ -1065,6 +1105,7 @@ mod tests {
             api_token: None,
             read_token: None,
             auth_mode: AuthMode::Legacy,
+            route_permissions: Arc::new(HashMap::new()),
             tenancy_enabled: false,
             secure_cookie: false,
             allowed_hosts: Arc::new(vec!["localhost".into()]),
@@ -1084,6 +1125,18 @@ mod tests {
         assert!(matches!(acquire_db(&state).await, Err(StatusCode::SERVICE_UNAVAILABLE)));
         drop(permit);
         assert!(acquire_db(&state).await.is_ok());
+    }
+
+    #[test]
+    fn explicit_route_permissions_replace_default_operation_binding() {
+        let spec = crate::security_schema::SecuritySpec {
+            routes: vec![crate::security_schema::RouteRequirement {
+                method: "GET".into(), path: "/api/records".into(), permission: "patients.read".into(),
+            }],
+            roles: Vec::new(),
+        };
+        assert_eq!(spec.route_permissions().get(&("GET".into(), "/api/records".into())),
+            Some(&"patients.read".into()));
     }
 
     #[test]
