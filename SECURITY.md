@@ -191,10 +191,46 @@ Membership is checked on every API request, so subsequent operations are denied.
 - `/metrics` is blocked in tenant mode until an isolated administrative metrics strategy exists.
 - This implementation uses SQLite and runtime SQL authorization; it has not yet been ported to PostgreSQL, formally audited, or stress-tested at large scale. Do not handle sensitive customer data in production yet.
 
+## Extensible authorization policies (experimental)
+
+**RUX does not require a fixed list of roles.** Role names are application-defined, and access is determined by explicit permissions, not by whether a role is named `admin`, `manager`, `teacher`, etc.
+
+The historical `reader`, `editor`, and `admin` roles are **compatibility presets** inserted once for projects that already use them. Permissions can subsequently be revoked and are **not automatically restored** on restart. Custom roles begin with **zero permissions**.
+
+Example (run from the repository root after the app database exists):
+
+```powershell
+cargo run --release -- role create teste supervisor
+cargo run --release -- role allow teste supervisor records.read
+cargo run --release -- role allow teste supervisor records.update
+cargo run --release -- role allow teste supervisor orders.approve
+cargo run --release -- role list teste
+cargo run --release -- user create teste supervisor_1 supervisor
+cargo run --release -- tenant grant teste empresa-a supervisor_1 supervisor
+```
+
+The `orders.approve` action is a valid *custom policy identifier*, but the experimental generated CRUD only has handlers bound to `records.read`, `records.create`, `records.update`, `records.delete`, and `metrics.read` today. Future user-defined routes must explicitly associate their actions with named permissions. Merely creating `orders.approve` does **not** automatically protect an HTTP endpoint.
+
+A special permission `records.access_all` enables access to all **non-tenant** records for a logged-in user. It does not permit cross-tenant access. Give it only to roles that explicitly need that access.
+
+Role permissions can be changed while a server is running:
+
+```powershell
+cargo run --release -- role deny teste supervisor records.update
+```
+
+The runtime reloads effective permissions from SQLite on each authenticated API request. Once a permission is removed, subsequent requests are blocked. The browser UI may need to refresh to reflect a live role-policy change; **the backend remains the authorization boundary**.
+
+**Current boundaries:**
+- Role definitions and permission grants are project-wide. A role with the same name has the same permissions across different tenants; **tenant membership assignments** remain tenant-specific. Separate policies per tenant are planned.
+- Existing `rux_users`, `rux_identities` and `rux_tenant_memberships` tables retain older constrained role columns for database compatibility. New custom roles are stored in a separate `policy_role` column and are evaluated exclusively using policy grants in the current runtime. Avoid downgrading to an older RUX binary without reviewing access.
+- These CLI facilities are implemented. **Declarative custom security policies inside `app.rux` are a future compiler/parser feature**, not yet implemented.
+- Permissions use exact matches: there are no implicit role hierarchies, wildcards or "all privileges" simply because of a role's name.
+
 ## Security limitations / planned work
 
 1. Harden the new browser-user login: MFA, password recovery, trusted TLS-provider integration, session policies and security review.
-2. Harden tenant isolation: independent security review, data-transfer tooling, delegated tenant administration, immutable audits and granular ABAC (basic tenant membership and SQL filters are now implemented).
+2. Build first-class declarative RUX policy syntax, compile route-to-permission bindings, and support tenant-specific role policy definitions, followed by independent security auditing.
 3. Secret providers/rotation and first-class TLS/deployment integration.
 4. Dependency auditing, fuzzing, adversarial integration tests and external security audit.
 5. Migration away from the legacy generated JavaScript server, which is local-only and does not share the native Rust authorization middleware.
