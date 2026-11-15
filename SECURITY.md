@@ -224,8 +224,40 @@ The runtime reloads effective permissions from SQLite on each authenticated API 
 **Current boundaries:**
 - Role definitions and permission grants are project-wide. A role with the same name has the same permissions across different tenants; **tenant membership assignments** remain tenant-specific. Separate policies per tenant are planned.
 - Existing `rux_users`, `rux_identities` and `rux_tenant_memberships` tables retain older constrained role columns for database compatibility. New custom roles are stored in a separate `policy_role` column and are evaluated exclusively using policy grants in the current runtime. Avoid downgrading to an older RUX binary without reviewing access.
-- These CLI facilities are implemented. **Declarative custom security policies inside `app.rux` are a future compiler/parser feature**, not yet implemented.
+- The **single-entity CRUD parser** now accepts optional declarative `security` blocks directly inside an app. They support `role Name { allow resource.action }` and route-specific `require` rules for existing CRUD endpoints. **Arbitrary user-defined HTTP routes and a unified general parser remain future work.** Use `rux check` to validate, then `rux policy apply <file.rux>` to provision new role definitions before first login.
 - Permissions use exact matches: there are no implicit role hierarchies, wildcards or "all privileges" simply because of a role's name.
+
+## Inline RUX security declarations (CRUD-only preview)
+
+Example:
+
+```rux
+app Demo {
+    data Person {
+        name: Text
+    }
+
+    security {
+        role supervisor {
+            allow people.read
+        }
+
+        route GET "/api/records" {
+            require people.read
+        }
+    }
+}
+```
+
+The `security` block is **optional**, role names are arbitrary, and undeclared roles receive no new privileges. Each explicit `route` currently accepts only the native CRUD endpoints. Any unsupported route fails `rux check` instead of silently appearing protected. The runtime enforces the required permission for authenticated browser users, API identities, and tenant memberships. Legacy shared-token mode refuses to launch applications with explicit source route requirements.
+
+```powershell
+cargo run --release -- check examples/secure-crud.rux
+cargo run --release -- policy apply examples/secure-crud.rux
+cargo run --release -- role list SecurityExample
+```
+
+A `policy apply` command prepares the SQLite policy tables and source-owned role grants without starting a web server. The server also synchronizes source-owned policies on startup in one transaction; removing a source-defined grant removes that privilege on subsequent requests after a restart. CLI changes to a source-managed role are overridden by source synchronization. The source cannot yet define arbitrary application routes or automatically initialize users.
 
 ## Security limitations / planned work
 
