@@ -16,6 +16,11 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo run -- check examples/hello.rux
       - run: cargo run -- check examples/secure-crud.rux
+      - name: Declarative security provisioning smoke test
+        run: |
+          cargo run --quiet -- policy apply examples/secure-crud.rux
+          cargo run --quiet -- role list SecurityExample | grep -q physician
+          cargo run --quiet -- role list SecurityExample | grep -q patients.read
       - run: |
           output="$(cargo run --quiet -- run examples/hello.rux)"
           test "$output" = "Hello, World!"
