@@ -119,7 +119,7 @@ pub fn memberships(db: &Connection, user_id: &str) -> rusqlite::Result<Vec<Membe
 
 pub fn membership(db: &Connection, user_id: &str, tenant_id: &str) -> rusqlite::Result<Option<Membership>> {
     db.query_row(
-        "SELECT t.id,t.slug,t.name,m.role
+        "SELECT t.id,t.slug,t.name,COALESCE(m.policy_role,m.role)
          FROM rux_tenant_memberships m
          JOIN rux_tenants t ON t.id = m.tenant_id
          JOIN rux_users u ON u.id = m.user_id
