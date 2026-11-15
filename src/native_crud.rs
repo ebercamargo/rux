@@ -759,7 +759,7 @@ pub async fn serve_with_security(
     }
     let db = r2d2::Pool::builder().max_size(pool_size).build(manager).map_err(|e| e.to_string())?;
     {
-        let mut connection = db.get().map_err(|e| e.to_string())?;
+        let connection = db.get().map_err(|e| e.to_string())?;
         connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS records (
             id TEXT PRIMARY KEY, payload TEXT NOT NULL, owner_user_id TEXT, tenant_id TEXT);")
             .map_err(|e| e.to_string())?;
