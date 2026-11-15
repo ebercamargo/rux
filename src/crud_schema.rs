@@ -51,14 +51,21 @@ pub fn chrono_datetime_pattern(pattern: &str) -> Result<String, String> {
     Ok(result)
 }
 
+pub fn parse_typed_app(source: &str) -> Result<(String, Vec<(String, String)>, Option<super::security_schema::SecuritySpec>), String> {
+    let (clean, policy) = super::security_schema::parse_source(source)?;
+    let (name, fields) = parse_typed_schema(&clean)?;
+    Ok((name, fields, policy))
+}
+
 pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>), String> {
+    let (clean, _) = super::security_schema::parse_source(source)?;
     let mut app = None;
     let mut entity = None;
     let mut fields = Vec::new();
     let mut depth = 0usize;
     let mut entity_depth = None;
     let mut app_depth = None;
-    for (index, raw) in source.lines().enumerate() {
+    for (index, raw) in clean.lines().enumerate() {
         let line = raw.split("//").next().unwrap_or("").trim();
         if line.is_empty() { continue; }
         let open = line.chars().filter(|&c| c == '{').count();
@@ -167,6 +174,14 @@ pub fn parse_typed_schema(source: &str) -> Result<(String, Vec<(String, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_inline_security_without_changing_data_fields() {
+        let source = "app Example {\n data Customer {\n  name: Text\n }\n security {\n  role physician {\n   allow records.read\n  }\n }\n}";
+        let (name, fields, security) = parse_typed_app(source).unwrap();
+        assert_eq!(name, "Example");
+        assert_eq!(fields, vec![("name".to_owned(), "Text".to_owned())]);
+        assert_eq!(security.unwrap().roles[0].name, "physician");
+    }
     #[test]
     fn parses_schema() {
         let src = "app Clientes {\n data Cliente {\n nome: Text\n email: Email\n idade: Int\n }\n}";
