@@ -21,7 +21,13 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             revoked_at TEXT
         );",
-    )
+    )?;
+    let has_role: i64 = db.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('rux_identities') WHERE name = 'policy_role'",
+        [], |row| row.get(0),
+    )?;
+    if has_role == 0 { db.execute_batch("ALTER TABLE rux_identities ADD COLUMN policy_role TEXT")?; }
+    super::policy::initialize(db)
 }
 
 fn digest(token: &str) -> String {
@@ -34,19 +40,19 @@ fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-fn valid_role(role: &str) -> bool {
-    matches!(role, "reader" | "editor" | "admin")
-}
-
 pub fn create(db: &Connection, name: &str, role: &str) -> Result<String, String> {
     if !valid_name(name) { return Err("Identity name must be 3-64 ASCII letters, numbers, '_' or '-' and start with a letter".into()); }
-    if !valid_role(role) { return Err("Role must be reader, editor, or admin".into()); }
     initialize(db).map_err(|e| e.to_string())?;
+    if !super::policy::exists(db,role).map_err(|e| e.to_string())? {
+        return Err(format!("Unknown role '{role}'. Create it with: rux role create <project> {role}"));
+    }
     // Two independent UUIDv4 values provide high-entropy API credentials.
     let token = format!("rux_{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
     db.execute(
-        "INSERT INTO rux_identities (id, name, role, token_hash) VALUES (?1, ?2, ?3, ?4)",
-        params![uuid::Uuid::new_v4().to_string(), name, role, digest(&token)],
+        "INSERT INTO rux_identities (id, name, role, policy_role, token_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![uuid::Uuid::new_v4().to_string(), name,
+            if matches!(role, "reader" | "editor" | "admin") { role } else { "reader" },
+            role, digest(&token)],
     ).map_err(|error| format!("Cannot create identity (name may already exist): {error}"))?;
     Ok(token)
 }
@@ -69,7 +75,7 @@ pub fn revoke(db: &Connection, name: &str) -> Result<bool, String> {
 
 pub fn list(db: &Connection) -> Result<Vec<(String, String, bool)>, String> {
     initialize(db).map_err(|e| e.to_string())?;
-    let mut stmt = db.prepare("SELECT name, role, revoked_at IS NOT NULL FROM rux_identities ORDER BY name")
+    let mut stmt = db.prepare("SELECT name, COALESCE(policy_role,role), revoked_at IS NOT NULL FROM rux_identities ORDER BY name")
         .map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(|e| e.to_string())?;
@@ -85,17 +91,12 @@ pub fn authorize(db: &Connection, header: Option<&str>, operation: &str) -> rusq
         return Ok(Decision::Unauthenticated);
     }
     let role: Option<String> = db.query_row(
-        "SELECT role FROM rux_identities WHERE token_hash = ?1 AND revoked_at IS NULL",
+        "SELECT COALESCE(policy_role,role) FROM rux_identities WHERE token_hash = ?1 AND revoked_at IS NULL",
         params![digest(token)],
         |row| row.get(0),
     ).optional()?;
     let Some(role) = role else { return Ok(Decision::Unauthenticated); };
-    let permitted = match operation {
-        "GET" | "HEAD" => matches!(role.as_str(), "reader" | "editor" | "admin"),
-        "POST" | "PUT" | "PATCH" => matches!(role.as_str(), "editor" | "admin"),
-        "DELETE" | "METRICS" => role == "admin",
-        _ => false,
-    };
+    let permitted = super::policy::operation_allowed(db, &role, operation)?;
     Ok(if permitted { Decision::Allowed } else { Decision::Forbidden })
 }
 
@@ -124,6 +125,19 @@ pub fn list_in_project(project: &Path) -> Result<Vec<(String, String, bool)>, St
 mod tests {
     use super::*;
 
+    #[test]
+    fn api_identities_support_custom_roles_and_permissions() {
+        let db=Connection::open_in_memory().unwrap();
+        super::super::policy::create(&db,"integrator").unwrap();
+        let token=create(&db,"external_integrator","integrator").unwrap();
+        let header=format!("Bearer {token}");
+        assert_eq!(authorize(&db,Some(&header),"GET").unwrap(),Decision::Forbidden);
+        super::super::policy::allow(&db,"integrator","records.read").unwrap();
+        assert_eq!(authorize(&db,Some(&header),"GET").unwrap(),Decision::Allowed);
+        assert_eq!(authorize(&db,Some(&header),"DELETE").unwrap(),Decision::Forbidden);
+        super::super::policy::deny(&db,"integrator","records.read").unwrap();
+        assert_eq!(authorize(&db,Some(&header),"GET").unwrap(),Decision::Forbidden);
+    }
     #[test]
     fn roles_are_scoped_and_revocation_is_immediate() {
         let db = Connection::open_in_memory().unwrap();
