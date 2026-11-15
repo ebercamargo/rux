@@ -786,8 +786,6 @@ pub async fn serve_with_security(
         super::identity::initialize(&connection).map_err(|e| e.to_string())?;
         super::user_auth::initialize(&connection).map_err(|e| e.to_string())?;
         super::tenant::initialize(&connection).map_err(|e| e.to_string())?;
-        super::policy::sync_source_roles(&mut connection, security.as_ref())
-            .map_err(|error| format!("Cannot apply RUX security declarations: {error}"))?;
     }
     let rate_limit_per_minute: u32 = std::env::var("RUX_RATE_LIMIT_PER_MINUTE")
         .unwrap_or_else(|_| "120".into())
@@ -891,6 +889,11 @@ pub async fn serve_with_security(
         if super::tenant::active_count(&connection).map_err(|e| e.to_string())? == 0 {
             return Err("RUX_TENANCY=enabled requires an active tenant membership. Use: rux tenant create / grant".into());
         }
+    }
+    {
+        let mut connection = db.get().map_err(|e| e.to_string())?;
+        super::policy::sync_source_roles(&mut connection, security.as_ref())
+            .map_err(|error| format!("Cannot apply RUX security declarations: {error}"))?;
     }
     let secure_cookie = environment == "production" || !address.ip().is_loopback();
     let accepting = Arc::new(AtomicBool::new(true));
