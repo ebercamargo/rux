@@ -259,7 +259,7 @@ fn project_check(path: &str) {
 fn help() {
     println!("RUX {}", env!("CARGO_PKG_VERSION"));
     println!("Usage: rux <command> [file.rux]");
-    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity, user, tenant, role");
+    println!("Commands: dev, run, start, check, new, project-check, crud, crud-from, secret generate, identity, user, tenant, role, policy");
     println!("  project-check [dir]  Validate project layout and list modules");
     println!("  dev [file.rux]    Watch and restart on source changes");
     println!("  start [file.rux]  Start application");
@@ -275,6 +275,7 @@ fn help() {
     println!("  tenant grant <project> <slug> <user> <role>    Set any tenant-specific role");
     println!("  tenant revoke <project> <slug> <user>          Revoke membership");
     println!("  tenant list <project>                          List tenants");
+    println!("  policy apply <file.rux>                        Provision declared roles before first login");
     println!("  role create <project> <name>                   Create a role with no privileges");
     println!("  role allow <project> <name> <resource.action>  Assign an explicit permission");
     println!("  role deny <project> <name> <resource.action>   Remove a permission");
@@ -380,6 +381,30 @@ fn main() {
                     println!("{slug} | {name} | {}", if active { "ACTIVE" } else { "DISABLED" });
                 },
                 Err(error) => { eprintln!("RUX tenant error: {error}"); process::exit(1); }
+            }
+        }
+        [_, command, operation, source_path] if command == "policy" && operation == "apply" => {
+            let result = (|| -> Result<(), String> {
+                let source = fs::read_to_string(source_path)
+                    .map_err(|error| format!("Cannot read {source_path}: {error}"))?;
+                let (name, _, security) = rux::crud_schema::parse_typed_app(&source)?;
+                let security = security.ok_or("No security block found in the RUX source")?;
+                fs::create_dir_all(&name).map_err(|error| format!("Cannot prepare project: {error}"))?;
+                let mut db = rusqlite::Connection::open(Path::new(&name).join("records.sqlite"))
+                    .map_err(|error| format!("Cannot open project database: {error}"))?;
+                db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+                    .map_err(|error| error.to_string())?;
+                rux::user_auth::initialize(&db).map_err(|error| error.to_string())?;
+                rux::tenant::initialize(&db).map_err(|error| error.to_string())?;
+                rux::identity::initialize(&db).map_err(|error| error.to_string())?;
+                rux::policy::sync_source_roles(&mut db, Some(&security))?;
+                println!("Applied RUX security: {name} ({} role(s), {} route rule(s))",
+                    security.roles.len(), security.routes.len());
+                Ok(())
+            })();
+            if let Err(error) = result {
+                eprintln!("RUX policy error: {error}");
+                process::exit(1);
             }
         }
         [_, command, operation, project, name] if command == "role" && operation == "create" => {
