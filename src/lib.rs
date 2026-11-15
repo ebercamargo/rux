@@ -26,3 +26,5 @@ pub mod identity;
 pub mod user_auth;
 
 pub mod tenant;
+
+pub mod policy;
